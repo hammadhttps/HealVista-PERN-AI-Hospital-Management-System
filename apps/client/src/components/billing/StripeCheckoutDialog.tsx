@@ -4,7 +4,10 @@ import { Elements, PaymentElement, useElements, useStripe } from "@stripe/react-
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { useCreatePaymentIntent } from "../../hooks/mutations/useBillingMutations";
+import {
+  useCreatePaymentIntent,
+  useSyncPaymentIntent,
+} from "../../hooks/mutations/useBillingMutations";
 import { billKeys, paymentKeys } from "../../hooks/queries/useBilling";
 import { Button } from "../ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../ui/dialog";
@@ -83,7 +86,7 @@ function CheckoutForm({
   onCancel,
 }: {
   clientSecret: string;
-  onSuccess: () => void;
+  onSuccess: (paymentIntentId: string | null) => void;
   onCancel: () => void;
 }) {
   const { t } = useTranslation(["billing", "common"]);
@@ -97,7 +100,7 @@ function CheckoutForm({
 
     setSubmitting(true);
     try {
-      const { error } = await stripe.confirmPayment({
+      const { error, paymentIntent } = await stripe.confirmPayment({
         elements,
         clientSecret,
         confirmParams: {
@@ -110,7 +113,7 @@ function CheckoutForm({
         toast.error(getErrorMessage(error, t("billing:paymentFailed")));
       } else {
         toast.success(t("billing:paymentSubmitted"));
-        onSuccess();
+        onSuccess(paymentIntent?.id ?? null);
       }
     } catch (err) {
       toast.error(getErrorMessage(err, t("billing:paymentFailed")));
@@ -147,6 +150,7 @@ export default function StripeCheckoutDialog({
 }) {
   const { t } = useTranslation(["billing", "common"]);
   const createIntent = useCreatePaymentIntent();
+  const { mutate: syncIntent } = useSyncPaymentIntent();
   const queryClient = useQueryClient();
   const [clientSecret, setClientSecret] = useState<string | null>(null);
   const preparedForRef = useRef<string | null>(null);
@@ -269,10 +273,16 @@ export default function StripeCheckoutDialog({
         <Elements stripe={stripeInstance} options={{ ...CHECKOUT_APPEARANCE, clientSecret }}>
           <CheckoutForm
             clientSecret={clientSecret}
-            onSuccess={() => {
-              queryClient.invalidateQueries({ queryKey: billKeys.all });
-              queryClient.invalidateQueries({ queryKey: paymentKeys.all });
+            onSuccess={(paymentIntentId) => {
               handleOpenChange(false);
+              if (paymentIntentId) {
+                // Settles the bill from Stripe's record now; the webhook stays the
+                // backstop. A failure here is harmless — the webhook still lands.
+                syncIntent(paymentIntentId);
+              } else {
+                queryClient.invalidateQueries({ queryKey: billKeys.all });
+                queryClient.invalidateQueries({ queryKey: paymentKeys.all });
+              }
             }}
             onCancel={() => handleOpenChange(false)}
           />

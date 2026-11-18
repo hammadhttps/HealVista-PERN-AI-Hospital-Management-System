@@ -126,6 +126,17 @@ export const createIntentSchema = z.object({
 
 export type CreateIntentInput = z.infer<typeof createIntentSchema>;
 
+/** `POST /api/payments/intents/:providerRef/sync` — read an intent back from the gateway. */
+export const syncIntentParamsSchema = z.object({
+  providerRef: z
+    .string()
+    .min(3)
+    .max(255)
+    .regex(/^[A-Za-z0-9_]+$/, "Invalid payment reference"),
+});
+
+export type SyncIntentParams = z.infer<typeof syncIntentParamsSchema>;
+
 export const cashPaymentSchema = z.object({
   billId: z.string().uuid(),
   amount: moneyString,
@@ -147,6 +158,9 @@ export const paymentHistorySchema = z.object({
   method: paymentMethodEnum.optional(),
   fromDate: z.coerce.date().optional(),
   toDate: z.coerce.date().optional(),
+  // Abandoned and declined card attempts move no money, so history hides them
+  // unless asked. A string enum, not z.coerce.boolean() — that reads "false" as true.
+  includeFailed: z.enum(["true", "false"]).optional(),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),
 });

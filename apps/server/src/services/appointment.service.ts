@@ -148,7 +148,12 @@ export async function bookAppointment(data: {
         doctorId: data.doctorId,
         slotId: data.slotId,
         departmentId: data.departmentId ?? null,
-        status: data.source === "WALK_IN" ? "CONFIRMED" : "PENDING_PAYMENT",
+        // Every booking is confirmed on creation. Billing is post-visit — the bill is
+        // raised when the consultation completes — so there is nothing to pay at
+        // booking time. The old `PENDING_PAYMENT` default waited on a payment that
+        // could never be made, which left online bookings unable to check in and
+        // without reminders or a chat thread.
+        status: "CONFIRMED",
         source: data.source ?? "ONLINE",
         reasonNote: data.reasonNote ?? null,
         qrToken,
@@ -535,7 +540,9 @@ export async function checkInAppointment(qrToken: string, userId: string) {
     include: { slot: true, patient: true },
   });
   if (!appointment) throw new AppError("Invalid QR token", 404);
-  if (appointment.status !== "CONFIRMED") {
+  // PENDING_PAYMENT is accepted for bookings made before every booking was created
+  // CONFIRMED (see bookAppointment) — those patients still arrive at the desk.
+  if (appointment.status !== "CONFIRMED" && appointment.status !== "PENDING_PAYMENT") {
     throw new AppError(`Cannot check in appointment with status ${appointment.status}`, 400);
   }
 

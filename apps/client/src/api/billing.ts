@@ -33,8 +33,15 @@ export const billApi = {
 
   removeDiscount: (id: string) => api.delete(`/bills/${id}/discount`).then((r) => r.data.data),
 
-  /** Opens in a new tab rather than fetching — the endpoint streams a PDF. */
-  pdfUrl: (id: string) => `/api/bills/${id}/pdf`,
+  /**
+   * The invoice PDF, fetched through the API client. It used to be opened as a bare
+   * `/api/bills/:id/pdf` link, which carries no bearer token (the API rejects it)
+   * and in production resolves against the static host (which serves index.html).
+   */
+  downloadPdf: async (id: string): Promise<Blob> => {
+    const res = await api.get(`/bills/${id}/pdf`, { responseType: "blob" });
+    return res.data as Blob;
+  },
 };
 
 export const discountApi = {
@@ -54,6 +61,17 @@ export const discountApi = {
 export const paymentApi = {
   createIntent: (data: { billId: string; amount?: string; provider?: "stripe" }) =>
     api.post("/payments/create-intent", data).then((r) => r.data.data),
+
+  /** Asks the server to read the intent back from Stripe and settle it if it succeeded. */
+  syncIntent: (providerRef: string) =>
+    api
+      .post<{
+        data: {
+          payment: { paymentId: string; status: string; changed: boolean };
+          bill: { id: string; status: string; balance: string; amountPaid: string } | null;
+        };
+      }>(`/payments/intents/${providerRef}/sync`)
+      .then((r) => r.data.data),
 
   recordCash: (data: { billId: string; amount: string; reference?: string }) =>
     api.post("/payments/cash", data).then((r) => r.data.data),

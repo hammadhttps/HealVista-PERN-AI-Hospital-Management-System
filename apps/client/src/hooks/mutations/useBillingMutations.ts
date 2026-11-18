@@ -204,6 +204,22 @@ export function useCreatePaymentIntent() {
   });
 }
 
+/**
+ * Settles a card payment server-side right after Stripe confirms it, instead of
+ * waiting for the webhook. The server reads the intent from Stripe — the browser's
+ * "success" is only the trigger, never the evidence.
+ */
+export function useSyncPaymentIntent() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: paymentApi.syncIntent,
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: billKeys.all });
+      queryClient.invalidateQueries({ queryKey: paymentKeys.all });
+    },
+  });
+}
+
 export function useRefundPayment() {
   const invalidate = useInvalidateBilling();
   return useMutation({

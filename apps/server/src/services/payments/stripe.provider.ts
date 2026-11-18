@@ -3,6 +3,7 @@ import { env } from "../../config/env.js";
 import { AppError } from "../../utils/AppError.js";
 import {
   PaymentProviderUnavailable,
+  type IntentStatus,
   type PaymentIntent,
   type PaymentProvider,
   type RefundResult,
@@ -24,6 +25,22 @@ function toMinorUnits(amount: string): number {
 
 function fromMinorUnits(minor: number): string {
   return (minor / 100).toFixed(2);
+}
+
+function toIntentState(status: Stripe.PaymentIntent.Status): IntentStatus["state"] {
+  switch (status) {
+    case "succeeded":
+      return "succeeded";
+    case "canceled":
+      return "canceled";
+    case "processing":
+    case "requires_capture":
+      return "processing";
+    default:
+      // requires_payment_method / requires_confirmation / requires_action — the
+      // customer can still complete this intent.
+      return "open";
+  }
 }
 
 export const stripeProvider: PaymentProvider = {
@@ -64,6 +81,21 @@ export const stripeProvider: PaymentProvider = {
     };
   },
 
+  async retrieveIntent(providerRef: string): Promise<IntentStatus> {
+    const intent = await stripe().paymentIntents.retrieve(providerRef);
+    return {
+      providerRef: intent.id,
+      state: toIntentState(intent.status),
+      clientSecret: intent.client_secret,
+      amount: fromMinorUnits(intent.amount),
+      currency: intent.currency.toUpperCase(),
+    };
+  },
+
+  async cancelIntent(providerRef: string): Promise<void> {
+    await stripe().paymentIntents.cancel(providerRef);
+  },
+
   verifyWebhook(rawBody: Buffer, signature: string): VerifiedWebhookEvent {
     if (!env.STRIPE_WEBHOOK_SECRET) throw new PaymentProviderUnavailable("stripe");
 
@@ -97,7 +129,18 @@ export const stripeProvider: PaymentProvider = {
           amount: fromMinorUnits(intent.amount),
         };
       }
+      case "payment_intent.canceled": {
+        const intent = event.data.object as Stripe.PaymentIntent;
+        return {
+          eventId: event.id,
+          type: "payment_canceled",
+          providerRef: intent.id,
+          amount: fromMinorUnits(intent.amount),
+        };
+      }
       case "charge.refunded": {
+        // `amount_refunded` is cumulative across every refund on the charge, which
+        // is exactly what billing applies (see VerifiedWebhookEvent.amount).
         const charge = event.data.object as Stripe.Charge;
         return {
           eventId: event.id,

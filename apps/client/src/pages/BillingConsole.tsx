@@ -9,6 +9,7 @@ import {
   useRecordCashPayment,
 } from "../hooks/mutations/useBillingMutations";
 import { billApi } from "../api/billing";
+import { downloadBlob } from "../lib/downloadBlob";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -47,6 +48,16 @@ export default function BillingConsole() {
   const [cashAmounts, setCashAmounts] = useState<Record<string, string>>({});
   const [previewDiscounts, setPreviewDiscounts] = useState<Record<string, string>>({});
   const [checkoutBill, setCheckoutBill] = useState<{ id: string; balance: string } | null>(null);
+
+  /** Fetches the invoice with the session's credentials and saves it. */
+  async function downloadInvoice(bill: { id: string; billNumber?: string }) {
+    try {
+      const blob = await billApi.downloadPdf(bill.id);
+      downloadBlob(blob, `invoice-${bill.billNumber ?? bill.id}.pdf`);
+    } catch (e) {
+      toast.error(getErrorMessage(e, t("billing:invoiceFailed")));
+    }
+  }
 
   const filters = tab ? { status: tab } : {};
   const { data, isLoading, isError } = useBills(filters);
@@ -244,11 +255,7 @@ export default function BillingConsole() {
                     )}
 
                     <div className="flex flex-wrap gap-2 pt-1">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => window.open(billApi.pdfUrl(bill.id), "_blank", "noopener")}
-                      >
+                      <Button size="sm" variant="outline" onClick={() => downloadInvoice(bill)}>
                         {t("billing:invoicePdf")}
                       </Button>
                       {Number(bill.balance) > 0 &&

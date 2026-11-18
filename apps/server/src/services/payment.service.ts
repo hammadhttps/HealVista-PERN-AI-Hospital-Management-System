@@ -8,7 +8,12 @@ import { dispatchNotification } from "./notification.service.js";
 import * as settingsService from "./settings.service.js";
 import { BILL_STATUS, assertCanAccessBill, deriveStatus, type Actor } from "./bill.service.js";
 import { stripeProvider } from "./payments/stripe.provider.js";
-import type { PaymentProvider, PaymentIntent } from "./payments/PaymentProvider.js";
+import type {
+  IntentStatus,
+  PaymentIntent,
+  PaymentProvider,
+  VerifiedWebhookEvent,
+} from "./payments/PaymentProvider.js";
 import type {
   CashPaymentInput,
   CreateIntentInput,
@@ -17,6 +22,8 @@ import type {
 } from "@healvista/shared";
 
 const D = Prisma.Decimal;
+type Decimal = Prisma.Decimal;
+type Tx = Prisma.TransactionClient;
 
 const providers: Record<string, PaymentProvider> = {
   stripe: stripeProvider,
@@ -27,6 +34,15 @@ function getProvider(name: string): PaymentProvider {
   if (!provider) throw new AppError(`Unknown payment provider: ${name}`, 400);
   return provider;
 }
+
+/** Payment rows whose money counts towards a bill (net of their own refunds). */
+const SETTLED_STATUSES: Array<"SUCCEEDED" | "REFUNDED"> = ["SUCCEEDED", "REFUNDED"];
+
+/**
+ * How long an unpaid card intent stays reusable. Re-opening checkout inside this
+ * window returns the same intent rather than a second chargeable one.
+ */
+const INTENT_REUSE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** A bill must be finalised before money can be taken against it. */
 function assertPayable(bill: { status: string; balance: Prisma.Decimal }) {
@@ -42,64 +58,271 @@ function assertPayable(bill: { status: string; balance: Prisma.Decimal }) {
 }
 
 /**
- * Records a payment and recomputes the bill in one transaction.
+ * Serialises every money movement on one bill.
  *
- * This is the only place `amountPaid`, `balance`, and `status` are written. Doing it
- * anywhere else risks a bill whose stated balance disagrees with its payment rows —
- * which, in billing, is the bug that costs real money.
+ * A cash payment at the desk, a card webhook and a refund can all land on the same
+ * bill at the same moment. Each reads the balance and writes a new one; without a
+ * row lock two of them read the same balance and one write silently wins — the
+ * classic lost update, here measured in real money.
+ */
+async function lockBill(tx: Tx, billId: string): Promise<void> {
+  await tx.$executeRaw`SELECT 1 FROM bills WHERE id = ${billId} FOR UPDATE`;
+}
+
+/**
+ * Recomputes `amountPaid`, `balance` and `status` from the bill's payment rows.
+ *
+ * This is the only place those three fields are written, and it must run inside
+ * the transaction that changed the payment rows, after `lockBill`. Recomputing from
+ * the rows — rather than adding the latest amount to a stored total — means a bill
+ * can never drift from the payments that back it.
+ */
+async function recomputeBillTotals(tx: Tx, billId: string) {
+  const bill = await tx.bill.findUnique({
+    where: { id: billId },
+    include: { patient: { select: { userId: true, fullName: true } } },
+  });
+  if (!bill) throw new AppError("Bill not found", 404);
+
+  const settled = await tx.payment.aggregate({
+    where: { billId, status: { in: SETTLED_STATUSES } },
+    _sum: { amount: true, refundedAmount: true },
+  });
+  const amountPaid = (settled._sum.amount ?? new D(0)).minus(
+    settled._sum.refundedAmount ?? new D(0),
+  );
+
+  const updated = await tx.bill.update({
+    where: { id: billId },
+    data: {
+      amountPaid,
+      balance: bill.total.minus(amountPaid),
+      status: deriveStatus(bill.total, amountPaid, bill.status),
+    },
+    include: { items: true, payments: true, discount: true },
+  });
+
+  return { bill: updated, patient: bill.patient };
+}
+
+/** What a settled card payment leaves for after the transaction commits. */
+interface Settlement {
+  billId: string;
+  billNumber: string;
+  balance: Decimal;
+  amount: Decimal;
+  patientUserId: string;
+  /** Positive when the bill has now collected more than its total. */
+  overpaidBy: Decimal;
+}
+
+/**
+ * Promotes a card payment to SUCCEEDED and recomputes its bill — idempotently.
+ *
+ * The conditional `updateMany` is the guard: the webhook and the client-triggered
+ * reconcile can both try to settle the same payment, and only the one whose update
+ * actually flips the row goes on to touch the bill. Returns null when someone else
+ * already settled it.
+ */
+async function settleSucceededPayment(
+  tx: Tx,
+  payment: { id: string; billId: string; amount: Decimal },
+): Promise<Settlement | null> {
+  await lockBill(tx, payment.billId);
+
+  const flipped = await tx.payment.updateMany({
+    where: { id: payment.id, status: { notIn: SETTLED_STATUSES } },
+    data: { status: "SUCCEEDED" },
+  });
+  if (flipped.count === 0) return null;
+
+  const { bill, patient } = await recomputeBillTotals(tx, payment.billId);
+  return {
+    billId: bill.id,
+    billNumber: bill.billNumber,
+    balance: bill.balance,
+    amount: payment.amount,
+    patientUserId: patient.userId,
+    overpaidBy: bill.amountPaid.minus(bill.total),
+  };
+}
+
+/**
+ * Sets a payment's refunded total to a **cumulative** figure, never adding a delta.
+ *
+ * Both the in-app refund and the gateway's `charge.refunded` webhook describe the
+ * same refund; whichever lands second must be a no-op. Taking the larger of the
+ * stored and incoming cumulative totals makes the two paths commute.
+ */
+async function applyRefundTotal(
+  tx: Tx,
+  paymentId: string,
+  cumulative: Decimal,
+  extra: { refundRef?: string | null } = {},
+): Promise<boolean> {
+  const payment = await tx.payment.findUnique({ where: { id: paymentId } });
+  if (!payment) throw new AppError("Payment not found", 404);
+
+  await lockBill(tx, payment.billId);
+
+  const target = D.min(cumulative, payment.amount);
+  if (target.lessThanOrEqualTo(payment.refundedAmount)) return false;
+
+  await tx.payment.update({
+    where: { id: paymentId },
+    data: {
+      refundedAmount: target,
+      refundedAt: new Date(),
+      ...(extra.refundRef ? { refundRef: extra.refundRef } : {}),
+      // A refund is only possible on money that was taken, so a row the gateway
+      // refunded is settled even if its success webhook has not arrived yet.
+      status: target.greaterThanOrEqualTo(payment.amount) ? "REFUNDED" : "SUCCEEDED",
+    },
+  });
+  await recomputeBillTotals(tx, payment.billId);
+  return true;
+}
+
+/** Side effects of a settlement that must never roll back the money itself. */
+async function afterSettlement(settlement: Settlement): Promise<void> {
+  if (settlement.overpaidBy.greaterThan(0)) {
+    // Two checkouts for the same balance both went through. The money is real, so
+    // it is recorded — but an accountant has to refund the excess.
+    logger.error(
+      {
+        billId: settlement.billId,
+        billNumber: settlement.billNumber,
+        overpaidBy: settlement.overpaidBy.toFixed(2),
+      },
+      "Bill overpaid — refund the excess from the payment history",
+    );
+  }
+  await notifyReceipt(
+    settlement.patientUserId,
+    { billNumber: settlement.billNumber, balance: settlement.balance },
+    settlement.amount,
+  );
+}
+
+/**
+ * Records a desk payment and recomputes the bill in one transaction.
+ *
+ * Payability and the balance are re-checked under the bill lock: a card payment can
+ * settle between the caller's first read and this write, and checking only outside
+ * the transaction is how a bill ends up collecting more than it is owed.
  */
 async function recordPayment(params: {
   billId: string;
   amount: Prisma.Decimal;
   method: "CARD" | "CASH" | "BANK_TRANSFER" | "WALLET" | "INSURANCE";
-  status?: "PENDING" | "SUCCEEDED" | "FAILED";
-  provider?: string | null;
-  providerRef?: string | null;
   receivedById?: string | null;
   reference?: string | null;
 }) {
   return prismaDirect.$transaction(async (tx) => {
-    const bill = await tx.bill.findUnique({
+    await lockBill(tx, params.billId);
+
+    const current = await tx.bill.findUnique({
       where: { id: params.billId },
-      include: { patient: { select: { userId: true, fullName: true } } },
+      select: { status: true, balance: true },
     });
-    if (!bill) throw new AppError("Bill not found", 404);
+    if (!current) throw new AppError("Bill not found", 404);
+    assertPayable(current);
+    if (params.amount.greaterThan(current.balance)) {
+      throw new AppError("Amount exceeds the outstanding balance on this bill", 400);
+    }
 
     const payment = await tx.payment.create({
       data: {
         billId: params.billId,
         amount: params.amount,
         method: params.method,
-        status: params.status ?? "SUCCEEDED",
-        provider: params.provider ?? null,
-        providerRef: params.providerRef ?? null,
+        status: "SUCCEEDED",
         receivedById: params.receivedById ?? null,
         reference: params.reference ?? null,
       },
     });
 
-    // Sum only settled money — a PENDING or FAILED row must not reduce the balance.
-    const settled = await tx.payment.aggregate({
-      where: { billId: params.billId, status: "SUCCEEDED" },
-      _sum: { amount: true, refundedAmount: true },
-    });
-    const amountPaid = (settled._sum.amount ?? new D(0)).minus(
-      settled._sum.refundedAmount ?? new D(0),
-    );
-    const balance = bill.total.minus(amountPaid);
-
-    const updatedBill = await tx.bill.update({
-      where: { id: params.billId },
-      data: {
-        amountPaid,
-        balance,
-        status: deriveStatus(bill.total, amountPaid, bill.status),
-      },
-      include: { items: true, payments: true, discount: true },
-    });
-
-    return { payment, bill: updatedBill, patient: bill.patient };
+    const { bill, patient } = await recomputeBillTotals(tx, params.billId);
+    return { payment, bill, patient };
   });
+}
+
+/**
+ * Looks for a card intent already open on this bill and either hands it back or
+ * retires it.
+ *
+ * Every open intent is independently chargeable. Creating a fresh one each time
+ * checkout opens left thousands of them behind — and two of them completed in two
+ * tabs charge the patient twice. So: an open intent for the same amount is reused;
+ * an open intent for a different amount (the balance moved) is cancelled; one that
+ * quietly succeeded is settled now.
+ */
+async function reuseOrRetireOpenIntents(
+  provider: PaymentProvider,
+  billId: string,
+  amount: Decimal,
+): Promise<PaymentIntent | null> {
+  const open = await prisma.payment.findMany({
+    where: {
+      billId,
+      provider: provider.name,
+      status: "PENDING",
+      providerRef: { not: null },
+      createdAt: { gte: new Date(Date.now() - INTENT_REUSE_WINDOW_MS) },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 5,
+  });
+
+  let reusable: PaymentIntent | null = null;
+
+  for (const row of open) {
+    let intent: IntentStatus;
+    try {
+      intent = await provider.retrieveIntent(row.providerRef!);
+    } catch (err) {
+      logger.warn({ err, paymentId: row.id }, "Could not read back an open payment intent");
+      continue;
+    }
+
+    if (intent.state === "succeeded") {
+      const settlement = await prismaDirect.$transaction((tx) => settleSucceededPayment(tx, row));
+      if (settlement) await afterSettlement(settlement);
+      throw new AppError(
+        "A card payment for this bill has just gone through. Refresh to see the updated balance.",
+        409,
+      );
+    }
+
+    if (intent.state === "processing") {
+      throw new AppError(
+        "A card payment for this bill is still processing. Try again in a minute.",
+        409,
+      );
+    }
+
+    if (intent.state === "open" && !reusable && intent.clientSecret && row.amount.equals(amount)) {
+      reusable = {
+        providerRef: intent.providerRef,
+        clientSecret: intent.clientSecret,
+        amount: amount.toFixed(2),
+        currency: intent.currency,
+      };
+      continue;
+    }
+
+    if (intent.state === "open") {
+      await provider.cancelIntent(row.providerRef!).catch((err) => {
+        logger.warn({ err, paymentId: row.id }, "Could not cancel a superseded payment intent");
+      });
+    }
+    await prisma.payment.updateMany({
+      where: { id: row.id, status: "PENDING" },
+      data: { status: "FAILED" },
+    });
+  }
+
+  return reusable;
 }
 
 export async function createIntent(input: CreateIntentInput, actor: Actor) {
@@ -118,8 +341,18 @@ export async function createIntent(input: CreateIntentInput, actor: Actor) {
     throw new AppError("Amount exceeds the outstanding balance on this bill", 400);
   }
 
-  const settings = (await settingsService.get()) as { currency: string };
   const provider = getProvider(input.provider);
+
+  const reused = await reuseOrRetireOpenIntents(provider, bill.id, amount);
+  if (reused) {
+    logger.info(
+      { billId: bill.id, providerRef: reused.providerRef },
+      "Reusing open payment intent",
+    );
+    return reused;
+  }
+
+  const settings = (await settingsService.get()) as { currency: string };
 
   logger.info(
     {
@@ -163,8 +396,9 @@ export async function createIntent(input: CreateIntentInput, actor: Actor) {
     "Payment intent created",
   );
 
-  // Recorded as PENDING now; the webhook is what promotes it to SUCCEEDED. The
-  // client returning "success" is a hint, never the source of truth.
+  // Recorded as PENDING now; the webhook (or a reconcile that reads the intent back
+  // from the gateway) is what promotes it to SUCCEEDED. The client returning
+  // "success" is a hint, never the source of truth.
   await prisma.payment.create({
     data: {
       billId: bill.id,
@@ -210,7 +444,6 @@ export async function recordCashPayment(input: CashPaymentInput, actor: Actor) {
     billId: input.billId,
     amount,
     method: "CASH",
-    status: "SUCCEEDED",
     receivedById: actor.userId,
     reference: input.reference ?? null,
   });
@@ -251,87 +484,155 @@ async function notifyReceipt(
     });
   } catch (err) {
     // A notification failure must never roll back a recorded payment.
-    console.error("[payment] receipt notification failed:", err);
+    logger.error({ err, userId }, "[payment] receipt notification failed");
+  }
+}
+
+type WebhookStatus =
+  | "duplicate"
+  | "ignored"
+  | "unknown_payment"
+  | "failed_recorded"
+  | "settled"
+  | "already_settled"
+  | "stale_event"
+  | "refund_recorded";
+
+/** Applies one verified event inside the transaction that also records it. */
+async function applyWebhookEvent(
+  tx: Tx,
+  providerName: string,
+  event: VerifiedWebhookEvent,
+): Promise<{ status: WebhookStatus; settlement?: Settlement }> {
+  if (event.type === "ignored" || !event.providerRef) return { status: "ignored" };
+
+  const payment = await tx.payment.findUnique({
+    where: { provider_providerRef: { provider: providerName, providerRef: event.providerRef } },
+  });
+  if (!payment) return { status: "unknown_payment" };
+
+  switch (event.type) {
+    case "payment_failed":
+    case "payment_canceled": {
+      // Events arrive out of order. A late failure for an earlier declined attempt
+      // must never un-settle a payment that has since succeeded — so only an
+      // unsettled row can fail.
+      const failed = await tx.payment.updateMany({
+        where: { id: payment.id, status: "PENDING" },
+        data: { status: "FAILED" },
+      });
+      return { status: failed.count > 0 ? "failed_recorded" : "stale_event" };
+    }
+
+    case "payment_succeeded": {
+      const settlement = await settleSucceededPayment(tx, payment);
+      return settlement ? { status: "settled", settlement } : { status: "already_settled" };
+    }
+
+    case "refunded": {
+      // A refund issued from the gateway's own dashboard reaches billing only
+      // through here. A refund made in the app arrives too, and is a no-op because
+      // the cumulative total already matches.
+      const changed = await applyRefundTotal(tx, payment.id, new D(event.amount ?? "0"));
+      return { status: changed ? "refund_recorded" : "stale_event" };
+    }
+
+    default:
+      return { status: "ignored" };
   }
 }
 
 /**
  * Handles a verified webhook exactly once.
  *
- * Idempotency is enforced by the unique constraint on (provider, eventId), not by a
- * prior SELECT — two concurrent retries would both pass a read check, and only the
- * database can arbitrate that race.
+ * The `webhook_events` row is written **in the same transaction** as the work it
+ * guards. If settling throws — a dropped connection, a lock timeout — the row rolls
+ * back with it and the provider's retry is processed afresh. Writing it first, in
+ * its own statement, turned every transient failure into a permanently PENDING
+ * payment: the retry was waved through as a "duplicate".
+ *
+ * Concurrent deliveries are arbitrated by the unique (provider, eventId) index: the
+ * second insert blocks until the first transaction commits, then fails with P2002.
  */
 export async function handleWebhook(providerName: string, rawBody: Buffer, signature: string) {
   const provider = getProvider(providerName);
   const event = provider.verifyWebhook(rawBody, signature);
 
+  let outcome: { status: WebhookStatus; settlement?: Settlement };
   try {
-    await prisma.webhookEvent.create({
-      data: { provider: provider.name, eventId: event.eventId, eventType: event.type },
+    outcome = await prismaDirect.$transaction(async (tx) => {
+      await tx.webhookEvent.create({
+        data: { provider: provider.name, eventId: event.eventId, eventType: event.type },
+      });
+      return applyWebhookEvent(tx, provider.name, event);
     });
   } catch (err) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-      return { status: "duplicate", eventId: event.eventId };
+      return { status: "duplicate" as const, eventId: event.eventId };
     }
     throw err;
   }
 
-  if (event.type === "ignored" || !event.providerRef) {
-    return { status: "ignored", eventId: event.eventId };
+  if (outcome.settlement) await afterSettlement(outcome.settlement);
+  return { status: outcome.status, eventId: event.eventId };
+}
+
+/**
+ * Asks the gateway what actually happened to a card payment and records it.
+ *
+ * The webhook is the primary path, but it can be late (a sleeping host), missing
+ * (an endpoint misconfigured) or never sent (local development without the CLI).
+ * Reading the intent back from the gateway — never trusting the browser's word —
+ * closes that gap. Safe to run any number of times, concurrently with the webhook.
+ */
+export async function reconcilePayment(paymentId: string) {
+  const payment = await prisma.payment.findUnique({ where: { id: paymentId } });
+  if (!payment) throw new AppError("Payment not found", 404);
+  if (!payment.provider || !payment.providerRef) {
+    return { paymentId, status: payment.status, changed: false };
+  }
+  if (payment.status !== "PENDING" && payment.status !== "FAILED") {
+    return { paymentId, status: payment.status, changed: false };
   }
 
-  const pending = await prisma.payment.findUnique({
-    where: {
-      provider_providerRef: { provider: provider.name, providerRef: event.providerRef },
-    },
-  });
-  if (!pending) return { status: "unknown_payment", eventId: event.eventId };
+  const intent = await getProvider(payment.provider).retrieveIntent(payment.providerRef);
 
-  if (event.type === "payment_failed") {
-    await prisma.payment.update({ where: { id: pending.id }, data: { status: "FAILED" } });
-    return { status: "failed_recorded", eventId: event.eventId };
+  if (intent.state === "succeeded") {
+    const settlement = await prismaDirect.$transaction((tx) => settleSucceededPayment(tx, payment));
+    if (settlement) await afterSettlement(settlement);
+    return { paymentId, status: "SUCCEEDED" as const, changed: Boolean(settlement) };
   }
 
-  if (event.type === "payment_succeeded") {
-    if (pending.status === "SUCCEEDED") {
-      return { status: "already_settled", eventId: event.eventId };
-    }
-
-    const result = await prismaDirect.$transaction(async (tx) => {
-      await tx.payment.update({ where: { id: pending.id }, data: { status: "SUCCEEDED" } });
-
-      const bill = await tx.bill.findUnique({
-        where: { id: pending.billId },
-        include: { patient: { select: { userId: true } } },
-      });
-      if (!bill) throw new AppError("Bill not found", 404);
-
-      const settled = await tx.payment.aggregate({
-        where: { billId: pending.billId, status: "SUCCEEDED" },
-        _sum: { amount: true, refundedAmount: true },
-      });
-      const amountPaid = (settled._sum.amount ?? new D(0)).minus(
-        settled._sum.refundedAmount ?? new D(0),
-      );
-
-      const updated = await tx.bill.update({
-        where: { id: pending.billId },
-        data: {
-          amountPaid,
-          balance: bill.total.minus(amountPaid),
-          status: deriveStatus(bill.total, amountPaid, bill.status),
-        },
-      });
-
-      return { bill: updated, patientUserId: bill.patient.userId };
+  if (intent.state === "canceled" && payment.status === "PENDING") {
+    const failed = await prisma.payment.updateMany({
+      where: { id: payment.id, status: "PENDING" },
+      data: { status: "FAILED" },
     });
-
-    await notifyReceipt(result.patientUserId, result.bill, pending.amount);
-    return { status: "settled", eventId: event.eventId };
+    return { paymentId, status: "FAILED" as const, changed: failed.count > 0 };
   }
 
-  return { status: "ignored", eventId: event.eventId };
+  return { paymentId, status: payment.status, changed: false };
+}
+
+/**
+ * Client-triggered reconcile, called right after checkout reports success so the
+ * bill updates in seconds even when the webhook is delayed. Scoped to callers who
+ * can see the bill.
+ */
+export async function syncIntent(providerRef: string, actor: Actor) {
+  const payment = await prisma.payment.findFirst({
+    where: { providerRef },
+    select: { id: true, billId: true },
+  });
+  if (!payment) throw new AppError("Payment not found", 404);
+  await assertCanAccessBill(payment.billId, actor);
+
+  const result = await reconcilePayment(payment.id);
+  const bill = await prisma.bill.findUnique({
+    where: { id: payment.billId },
+    select: { id: true, status: true, balance: true, amountPaid: true },
+  });
+  return { payment: result, bill };
 }
 
 export async function refundPayment(paymentId: string, input: RefundInput, actor: Actor) {
@@ -366,34 +667,13 @@ export async function refundPayment(paymentId: string, input: RefundInput, actor
     refundRef = result.refundRef;
   }
 
+  // The cumulative target, not a delta: the gateway's `charge.refunded` webhook may
+  // already have recorded this very refund by the time this transaction runs.
+  const cumulative = payment.refundedAmount.plus(amount);
   const updated = await prismaDirect.$transaction(async (tx) => {
-    const totalRefunded = payment.refundedAmount.plus(amount);
-
-    await tx.payment.update({
-      where: { id: paymentId },
-      data: {
-        refundedAmount: totalRefunded,
-        refundedAt: new Date(),
-        refundRef,
-        status: totalRefunded.greaterThanOrEqualTo(payment.amount) ? "REFUNDED" : "SUCCEEDED",
-      },
-    });
-
-    const settled = await tx.payment.aggregate({
-      where: { billId: payment.billId, status: { in: ["SUCCEEDED", "REFUNDED"] } },
-      _sum: { amount: true, refundedAmount: true },
-    });
-    const amountPaid = (settled._sum.amount ?? new D(0)).minus(
-      settled._sum.refundedAmount ?? new D(0),
-    );
-
-    return tx.bill.update({
+    await applyRefundTotal(tx, paymentId, cumulative, { refundRef });
+    return tx.bill.findUniqueOrThrow({
       where: { id: payment.billId },
-      data: {
-        amountPaid,
-        balance: payment.bill.total.minus(amountPaid),
-        status: deriveStatus(payment.bill.total, amountPaid, payment.bill.status),
-      },
       include: { payments: true },
     });
   });
@@ -434,6 +714,7 @@ export async function getPaymentHistory(filters: PaymentHistoryInput, actor: Act
 
   if (filters.billId) where.billId = filters.billId;
   if (filters.method) where.method = filters.method;
+  if (filters.includeFailed !== "true") where.status = { not: "FAILED" };
   if (filters.fromDate || filters.toDate) {
     where.createdAt = {};
     if (filters.fromDate) where.createdAt.gte = filters.fromDate;

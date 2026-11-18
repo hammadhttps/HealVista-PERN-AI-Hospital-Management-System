@@ -24,9 +24,28 @@ export interface RefundResult {
 export interface VerifiedWebhookEvent {
   /** The gateway's event id — the idempotency key. */
   eventId: string;
-  type: "payment_succeeded" | "payment_failed" | "refunded" | "ignored";
+  type: "payment_succeeded" | "payment_failed" | "payment_canceled" | "refunded" | "ignored";
   providerRef: string | null;
+  /**
+   * For `refunded`, the **cumulative** amount refunded on the payment so far — not
+   * the delta. Applying a cumulative figure is idempotent under redelivery and
+   * out-of-order arrival; adding deltas is not.
+   */
   amount: string | null;
+}
+
+/**
+ * An existing intent's state, read back from the gateway — the source of truth for
+ * whether money moved. Used to reuse an open checkout instead of opening a second
+ * one, and to reconcile payments whose webhook never arrived.
+ */
+export interface IntentStatus {
+  providerRef: string;
+  /** `succeeded` = money taken; `open` = the customer can still complete it. */
+  state: "succeeded" | "open" | "processing" | "canceled";
+  clientSecret: string | null;
+  amount: string;
+  currency: string;
 }
 
 export interface PaymentProvider {
@@ -40,6 +59,12 @@ export interface PaymentProvider {
   }): Promise<PaymentIntent>;
 
   refund(params: { providerRef: string; amount?: string }): Promise<RefundResult>;
+
+  /** Reads an intent's current state from the gateway. */
+  retrieveIntent(providerRef: string): Promise<IntentStatus>;
+
+  /** Cancels an open intent so it can no longer be charged. Best-effort for callers. */
+  cancelIntent(providerRef: string): Promise<void>;
 
   /**
    * Verifies the signature against the **raw** body and normalises the payload.

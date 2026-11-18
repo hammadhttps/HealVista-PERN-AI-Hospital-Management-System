@@ -1,6 +1,9 @@
 import { useTranslation } from "react-i18next";
 import { useMyBills } from "../hooks/queries/useBilling";
+import { toast } from "sonner";
 import { billApi } from "../api/billing";
+import { downloadBlob } from "../lib/downloadBlob";
+import { getErrorMessage } from "../utils/errors";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
@@ -30,6 +33,16 @@ export default function MyBills() {
   const { t } = useTranslation(["common", "bills"]);
   const { data, isLoading, isError } = useMyBills();
   const [checkoutBill, setCheckoutBill] = useState<{ id: string; balance: string } | null>(null);
+
+  /** Fetches the invoice with the session's credentials and saves it. */
+  async function downloadInvoice(bill: { id: string; billNumber?: string }) {
+    try {
+      const blob = await billApi.downloadPdf(bill.id);
+      downloadBlob(blob, `invoice-${bill.billNumber ?? bill.id}.pdf`);
+    } catch (e) {
+      toast.error(getErrorMessage(e, t("bills:invoiceFailed")));
+    }
+  }
 
   useEffect(() => {
     preloadStripe();
@@ -128,11 +141,7 @@ export default function MyBills() {
                 </div>
 
                 <div className="flex flex-wrap gap-2 pt-1">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => window.open(billApi.pdfUrl(bill.id), "_blank", "noopener")}
-                  >
+                  <Button size="sm" variant="outline" onClick={() => downloadInvoice(bill)}>
                     {t("bills:downloadInvoice")}
                   </Button>
                   {Number(bill.balance) > 0 &&

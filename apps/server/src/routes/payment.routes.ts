@@ -7,6 +7,7 @@ import {
   createIntentSchema,
   paymentHistorySchema,
   refundSchema,
+  syncIntentParamsSchema,
 } from "@healvista/shared";
 import * as paymentController from "../controllers/payment.controller.js";
 
@@ -19,6 +20,16 @@ router.post(
   authenticate,
   validate(createIntentSchema),
   paymentController.createIntent,
+);
+
+// Called by the checkout right after the card step reports success: the server
+// reads the intent back from the gateway and settles it, so the bill updates even
+// while the webhook is delayed. The browser's "success" is never trusted directly.
+router.post(
+  "/intents/:providerRef/sync",
+  authenticate,
+  validate(syncIntentParamsSchema, "params"),
+  paymentController.syncIntent,
 );
 
 router.post(

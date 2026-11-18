@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import type { PaymentHistoryInput } from "@healvista/shared";
+import type { PaymentHistoryInput, SyncIntentParams } from "@healvista/shared";
 import * as paymentService from "../services/payment.service.js";
 import { sendSuccess, sendPaginated } from "../utils/apiResponse.js";
 import { AppError } from "../utils/AppError.js";
@@ -11,6 +11,16 @@ export async function createIntent(req: Request, res: Response, next: NextFuncti
     // provider: undefined" for any client that omits it.
     const intent = await paymentService.createIntent(req.validated, req.user!);
     sendSuccess(res, intent, 201);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function syncIntent(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { providerRef } = req.validated as SyncIntentParams;
+    const result = await paymentService.syncIntent(providerRef, req.user!);
+    sendSuccess(res, result);
   } catch (err) {
     next(err);
   }

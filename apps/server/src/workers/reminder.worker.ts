@@ -1,7 +1,8 @@
 import { Worker } from "bullmq";
 import { bullConnection } from "../config/redis.js";
 import { prisma } from "../config/db.js";
-import { dispatchNotification, clearReminderJobIds } from "../services/notification.service.js";
+import { dispatchNotification } from "../services/notification.service.js";
+import { sendAppointmentReminder } from "../services/reminder.service.js";
 import { logger } from "../utils/logger.js";
 
 export function startReminderWorker(): Worker | null {
@@ -24,7 +25,7 @@ export function startReminderWorker(): Worker | null {
         where: { id: appointmentId },
         include: {
           patient: { include: { user: true } },
-          doctor: { include: { user: true } },
+          doctor: { select: { fullName: true } },
         },
       });
 
@@ -48,10 +49,10 @@ export function startReminderWorker(): Worker | null {
           userId: appointment.patient.user.id,
           type: "FOLLOW_UP_REMINDER",
           title: "Time to book your follow-up",
-          message: `Dr. ${appointment.doctor.user.email} asked you to book a follow-up visit. Tap to choose a time.`,
+          message: `Dr. ${appointment.doctor.fullName} asked you to book a follow-up visit. Tap to choose a time.`,
           linkUrl: `/doctors/${appointment.doctorId}`,
           data: {
-            doctorName: appointment.doctor.user.email,
+            doctorName: appointment.doctor.fullName,
             appointmentNo: appointment.appointmentNo,
           },
         });
@@ -60,34 +61,9 @@ export function startReminderWorker(): Worker | null {
         return;
       }
 
-      if (appointment.status !== "CONFIRMED" && appointment.status !== "CHECKED_IN") {
-        logger.info(
-          { appointmentId, status: appointment.status },
-          "[reminder-worker] Skipping - not active",
-        );
-        return;
-      }
-
-      await clearReminderJobIds(appointmentId);
-
-      await dispatchNotification({
-        userId: appointment.patient.user.id,
-        type: "APPOINTMENT_REMINDER",
-        title: type === "24h" ? "Appointment Tomorrow" : "Appointment in 1 Hour",
-        message:
-          type === "24h"
-            ? `You have an appointment with Dr. ${appointment.doctor.user.email} tomorrow.`
-            : `Your appointment with Dr. ${appointment.doctor.user.email} starts in 1 hour.`,
-        linkUrl: `/patient/appointments/${appointmentId}`,
-        data: {
-          doctorName: appointment.doctor.user.email,
-          date: appointment.createdAt.toISOString().split("T")[0],
-          time: appointment.slotId,
-          appointmentNo: appointment.appointmentNo,
-        },
-      });
-
-      logger.info({ appointmentId, type }, "[reminder-worker] Reminder dispatched");
+      // Pre-visit reminders share one implementation with the Redis-off sweep.
+      const outcome = await sendAppointmentReminder(appointmentId, type);
+      logger.info({ appointmentId, type, outcome }, "[reminder-worker] Pre-visit reminder");
     },
     { connection: bullConnection },
   );

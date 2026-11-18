@@ -383,9 +383,24 @@ function dailyAlertKey(scope: string, id: string): string {
   return `alert:${scope}:${id}:${day}`;
 }
 
+/**
+ * Daily-alert claims held in memory when Redis is off. Without this, every claim
+ * succeeded and the hourly in-process sweep would re-alert each low item 24 times a
+ * day. Single-instance only — which is the only deployment where Redis can be off.
+ */
+const localClaims = new Set<string>();
+
+function claimLocally(key: string): boolean {
+  const today = new Date().toISOString().slice(0, 10);
+  for (const k of localClaims) if (!k.endsWith(today)) localClaims.delete(k);
+  if (localClaims.has(key)) return false;
+  localClaims.add(key);
+  return true;
+}
+
 /** Claims the daily alert slot for an item. Returns false if one already fired today. */
 async function claimDailyAlert(scope: string, id: string): Promise<boolean> {
-  if (!redis) return true;
+  if (!redis) return claimLocally(dailyAlertKey(scope, id));
   try {
     const claimed = await redis.set(dailyAlertKey(scope, id), "1", "EX", 86400 * 2, "NX");
     return claimed === "OK";

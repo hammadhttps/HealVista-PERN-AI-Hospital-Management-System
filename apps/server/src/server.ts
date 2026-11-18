@@ -11,6 +11,8 @@ import { startEmbeddingWorker } from "./ai/embeddings.worker.js";
 import { startSummariesWorker } from "./workers/summaries.worker.js";
 import { startComplianceWorker } from "./workers/compliance.worker.js";
 import { setupSlotGenerationJob, setupPharmacySweepJob } from "./config/bull.js";
+import { checkAiProviderOnBoot } from "./ai/health.js";
+import { startInProcessSchedules } from "./workers/inProcessScheduler.js";
 
 const server = app.listen(env.PORT, () => {
   logger.info({ port: env.PORT, env: env.NODE_ENV }, `Server listening on port ${env.PORT}`);
@@ -32,6 +34,12 @@ if (env.NODE_ENV !== "test") {
   // without losing a schedule. Both are idempotent — upsert only when absent.
   void setupSlotGenerationJob();
   void setupPharmacySweepJob();
+  // Without Redis the schedulers above do nothing; run the same jobs on timers.
+  startInProcessSchedules();
+
+  // Surfaces a misconfigured AI provider in the deploy log instead of letting every
+  // feature fall back silently. Non-blocking.
+  void checkAiProviderOnBoot();
 }
 
 process.on("SIGTERM", () => {

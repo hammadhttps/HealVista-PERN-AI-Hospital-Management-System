@@ -43,6 +43,13 @@ const envSchema = z.object({
   JINA_API_KEY: z.string().optional(),
   JINA_CHAT_MODEL: z.string().default("jina-vlm"),
   JINA_EMBED_MODEL: z.string().default("jina-embeddings-v5-text-small"),
+  // Jina serves the two models from different hosts: `api.jina.ai` embeds, but its
+  // chat endpoint only accepts `jina-ocr-v1`. `jina-vlm` lives on its own host.
+  JINA_CHAT_BASE_URL: z.string().url().default("https://api-beta-vlm.jina.ai/v1"),
+  JINA_EMBED_BASE_URL: z.string().url().default("https://api.jina.ai/v1"),
+  // Photo OCR uses Jina's dedicated OCR model, which api.jina.ai serves.
+  JINA_OCR_MODEL: z.string().default("jina-ocr-v1"),
+  JINA_OCR_BASE_URL: z.string().url().default("https://api.jina.ai/v1"),
 
   STRIPE_SECRET_KEY: z.string().optional(),
   STRIPE_WEBHOOK_SECRET: z.string().optional(),

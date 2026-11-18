@@ -215,7 +215,26 @@ export async function runAnalyticsQuestion(
   if (cached) return cached;
 
   const intent = await classifyIntent(question);
-  const table = await QUERIES[intent].run(parseDays(question));
+  const days = parseDays(question);
+  const table = await QUERIES[intent].run(days);
+
+  // Nothing to narrate. Asked to narrate an empty table, the model invented
+  // "[Department 1], [Department 2], [Department 3]" — so it is never asked.
+  if (table.rows.length === 0) {
+    await logInteraction({
+      userId: actor.userId,
+      feature: "analytics-assistant",
+      question,
+      responseRef: "empty-result",
+      wasFallback: false,
+    });
+    return {
+      intent,
+      answer: `There is no data for "${QUERIES[intent].label}" in the last ${days} day(s). Try a longer period.`,
+      table,
+      fallback: false,
+    };
+  }
 
   let answer: string | null = null;
   let fallback = !isAiConfigured();
@@ -231,6 +250,11 @@ export async function runAnalyticsQuestion(
         system:
           "You are an operations analyst. Summarise what the numbers show. Never invent numbers not in the results.",
         maxTokens: 512,
+        // Template placeholders mean the model narrated a shape, not the data.
+        check: (out) =>
+          /\[[^\]]{1,40}\]|<[a-z ]{1,20}>/i.test(out.answer)
+            ? "It contains placeholder text instead of the actual values. Use only the names and numbers in the query results."
+            : null,
       });
       answer = result.answer;
       const usage = getProvider().lastUsage();

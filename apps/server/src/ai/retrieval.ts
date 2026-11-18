@@ -1,5 +1,7 @@
+import { Prisma } from "@prisma/client";
 import { prisma } from "../config/db.js";
 import { writeAuditLog } from "../utils/audit.js";
+import { logger } from "../utils/logger.js";
 import { getDependentPatientIds, type Actor } from "../services/access.service.js";
 import { stripPII } from "./pii.js";
 import { getProvider } from "./index.js";
@@ -162,34 +164,120 @@ export async function retrieve(
         LIMIT ${k}
       `;
 
-  const results = rows
-    .filter((r) => Number(r.similarity) >= minSimilarity)
-    .map((r) => ({
-      id: r.id,
-      content: r.content,
-      sourceType: r.sourceType,
-      sourceId: r.sourceId,
-      patientId: r.patientId,
-      chunkIndex: r.chunkIndex,
-      similarity: Number(r.similarity),
-    }));
+  const results = rows.filter((r) => Number(r.similarity) >= minSimilarity).map(toChunk);
 
-  // Any read of patient clinical data is audited — one row per patient whose chunks
-  // were actually surfaced, best-effort so retrieval never fails on a log write.
-  if (opts.actor && clinical) {
-    const patientsTouched = [...new Set(results.map((c) => c.patientId).filter(Boolean))];
-    await Promise.all(
-      patientsTouched.map((patientId) =>
-        writeAuditLog({
-          actorUserId: opts.actor!.userId,
-          action: "AI_RETRIEVAL",
-          targetType: "patient",
-          targetId: patientId!,
-          metadata: { feature: opts.feature ?? null, chunks: results.length, k },
-        }).catch(() => undefined),
-      ),
-    );
-  }
-
+  if (clinical) await auditRetrieval(results, opts, k);
   return results;
+}
+
+function toChunk(r: ChunkRow): RetrievedChunk {
+  return {
+    id: r.id,
+    content: r.content,
+    sourceType: r.sourceType,
+    sourceId: r.sourceId,
+    patientId: r.patientId,
+    chunkIndex: r.chunkIndex,
+    similarity: Number(r.similarity),
+  };
+}
+
+/**
+ * Any read of patient clinical data is audited — one row per patient whose chunks
+ * were actually surfaced, best-effort so retrieval never fails on a log write.
+ */
+async function auditRetrieval(results: RetrievedChunk[], opts: RetrieveOptions, k: number) {
+  if (!opts.actor) return;
+  const patientsTouched = [...new Set(results.map((c) => c.patientId).filter(Boolean))];
+  await Promise.all(
+    patientsTouched.map((patientId) =>
+      writeAuditLog({
+        actorUserId: opts.actor!.userId,
+        action: "AI_RETRIEVAL",
+        targetType: "patient",
+        targetId: patientId!,
+        metadata: { feature: opts.feature ?? null, chunks: results.length, k },
+      }).catch(() => undefined),
+    ),
+  );
+}
+
+const STOPWORDS = new Set(
+  (
+    "a an and are any as at be been but by can could did do does for from had has have how i if in " +
+    "into is it its me my no not of on or our should so than that the their them then there these " +
+    "they this to was we were what when where which who why will with would you your about after " +
+    "all also am before being between both each few more most other over same some such only own " +
+    "very just tell show give get got recent recently please summarise summarize"
+  ).split(" "),
+);
+
+/** The distinctive words of a question, for keyword matching. */
+export function keywordTerms(question: string): string[] {
+  const seen = new Set<string>();
+  for (const word of question.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (word.length < 3 || STOPWORDS.has(word)) continue;
+    seen.add(word);
+  }
+  return [...seen].slice(0, 8);
+}
+
+/**
+ * The non-AI fallback for `retrieve`: a keyword match over the same chunk store,
+ * under the **same scope rule** — the caller's patient ids are in the SQL `WHERE`
+ * exactly as in the vector path. An embedding outage degrades search to keywords;
+ * it never breaks it, and it never widens what a caller can see.
+ */
+export async function keywordRetrieve(
+  question: string,
+  scope: RetrievalScope,
+  opts: RetrieveOptions = {},
+): Promise<RetrievedChunk[]> {
+  const k = opts.k ?? 8;
+  const clinical = scope.patientIds.length > 0;
+  const kbMode = !clinical && Boolean(opts.kbOnly);
+  if (!clinical && !kbMode) return [];
+
+  const terms = keywordTerms(stripPII(question));
+  if (terms.length === 0) return [];
+
+  // Terms are [a-z0-9] only (see keywordTerms), so no LIKE metacharacter can appear.
+  const matches = terms.map((t) => Prisma.sql`(content ILIKE ${`%${t}%`})::int`);
+  const score = Prisma.join(matches, " + ");
+  const scopeClause = clinical
+    ? Prisma.sql`"patientId" = ANY(${scope.patientIds}::text[])`
+    : Prisma.sql`"patientId" IS NULL`;
+
+  const rows = await prisma.$queryRaw<ChunkRow[]>`
+    SELECT id, content, "sourceType", "sourceId", "patientId", "chunkIndex",
+           (${score})::float / ${terms.length} AS similarity
+    FROM document_chunks
+    WHERE ${scopeClause} AND (${score}) > 0
+    ORDER BY similarity DESC, "sourceId", "chunkIndex"
+    LIMIT ${k}
+  `;
+
+  const results = rows.map(toChunk);
+  if (clinical) await auditRetrieval(results, opts, k);
+  return results;
+}
+
+/**
+ * Vector retrieval with the keyword fallback behind it. `degraded` tells the caller
+ * the results came from keywords, so it can say so (fallback: true).
+ */
+export async function retrieveWithFallback(
+  question: string,
+  scope: RetrievalScope,
+  opts: RetrieveOptions = {},
+): Promise<{ chunks: RetrievedChunk[]; degraded: boolean }> {
+  try {
+    return { chunks: await retrieve(question, scope, opts), degraded: false };
+  } catch (err) {
+    logger.warn(
+      { feature: opts.feature, reason: err instanceof Error ? err.message : String(err) },
+      "Vector retrieval failed — falling back to keyword search",
+    );
+    return { chunks: await keywordRetrieve(question, scope, opts), degraded: true };
+  }
 }

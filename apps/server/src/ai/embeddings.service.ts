@@ -23,6 +23,18 @@ export interface EmbeddableSource {
   text: string;
   patientId?: string | null;
   departmentId?: string | null;
+  /** Names of the people this source is about, redacted before it leaves the server. */
+  knownNames?: string[];
+}
+
+/** The patient's own name and any guardian names on file — what stripPII must remove. */
+async function namesForPatient(patientId: string | null | undefined): Promise<string[]> {
+  if (!patientId) return [];
+  const patient = await prisma.patient.findUnique({
+    where: { id: patientId },
+    select: { fullName: true },
+  });
+  return patient?.fullName ? [patient.fullName] : [];
 }
 
 /** Loads the plain-text representation of an embeddable source. */
@@ -129,7 +141,8 @@ export async function embedSource(
     return 0;
   }
 
-  const cleanText = stripPII(source.text);
+  const knownNames = source.knownNames ?? (await namesForPatient(source.patientId));
+  const cleanText = stripPII(source.text, { knownNames });
   const chunks = chunkText(cleanText);
   if (chunks.length === 0) {
     await deleteChunksForSource(sourceType, sourceId);

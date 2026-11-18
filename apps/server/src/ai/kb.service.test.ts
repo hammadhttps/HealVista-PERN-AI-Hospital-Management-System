@@ -43,7 +43,18 @@ vi.mock("./index.js", () => ({
   isAiConfigured: vi.fn(),
 }));
 
-vi.mock("./retrieval.js", () => ({ retrieve: vi.fn() }));
+vi.mock("./retrieval.js", async () => {
+  const actual = await vi.importActual<typeof import("./retrieval.js")>("./retrieval.js");
+  const retrieve = vi.fn();
+  return {
+    retrieve,
+    keywordTerms: actual.keywordTerms,
+    retrieveWithFallback: vi.fn(async (...args: unknown[]) => ({
+      chunks: await retrieve(...args),
+      degraded: false,
+    })),
+  };
+});
 vi.mock("./aiInteraction.service.js", () => ({ logInteraction: vi.fn() }));
 vi.mock("../config/redis.js", () => ({
   redis: null,

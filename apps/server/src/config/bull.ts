@@ -89,19 +89,44 @@ export type EmbeddableSourceType =
 
 /**
  * Enqueues a source for embedding. Best-effort by design — a queue outage must
- * never fail the clinical write that triggered it; the backfill script
- * (`npm run db:embed`) catches anything missed.
+ * never fail the clinical write that triggered it.
+ *
+ * Without a queue (Redis off, or the enqueue failed) the source is embedded
+ * in-process instead, in the background. This used to be a silent no-op: every
+ * note signed, lab verified and prescription issued while Redis was off simply
+ * never reached the vector store, and the RAG assistant answered "I couldn't find
+ * anything" about records that plainly existed. `npm run db:embed` remains the
+ * backstop for anything this misses.
  */
 export async function addEmbeddingJob(
   sourceType: EmbeddableSourceType,
   sourceId: string,
 ): Promise<void> {
-  if (!embeddingsQueue) return;
-  try {
-    await embeddingsQueue.add("embed", { sourceType, sourceId });
-  } catch (err) {
-    console.error(`[embeddings] Failed to enqueue ${sourceType} ${sourceId}:`, err);
+  if (embeddingsQueue) {
+    try {
+      await embeddingsQueue.add("embed", { sourceType, sourceId });
+      return;
+    } catch (err) {
+      console.error(`[embeddings] Failed to enqueue ${sourceType} ${sourceId}:`, err);
+    }
   }
+  embedInBackground(sourceType, sourceId);
+}
+
+/**
+ * Fire-and-forget: the caller's request returns at once, the embedding follows.
+ * Imported lazily — the embedding pipeline pulls in the AI layer, which config
+ * modules must not load at startup.
+ */
+function embedInBackground(sourceType: EmbeddableSourceType, sourceId: string): void {
+  void import("../ai/embeddings.service.js")
+    .then(({ embedSource }) => embedSource(sourceType, sourceId))
+    .catch((err) =>
+      console.error(
+        `[embeddings] Inline embedding failed for ${sourceType} ${sourceId} — run npm run db:embed:`,
+        err instanceof Error ? err.message : err,
+      ),
+    );
 }
 
 /**

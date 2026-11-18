@@ -1,4 +1,21 @@
 import type { z } from "zod";
+import { AppError } from "../utils/AppError.js";
+
+/**
+ * A provider failure, tagged with whether trying again could help. Rate limits,
+ * timeouts and 5xx are transient; a rejected key or an invalid request is not, and
+ * retrying it only doubles the latency before the fallback runs.
+ */
+export class AiProviderError extends AppError {
+  readonly retryable: boolean;
+
+  constructor(message: string, statusCode: number, retryable: boolean) {
+    super(message, statusCode);
+    this.name = "AiProviderError";
+    this.retryable = retryable;
+    Object.setPrototypeOf(this, AiProviderError.prototype);
+  }
+}
 
 export interface GenerationImage {
   /** MIME type of the image, e.g. `image/png` or `image/jpeg`. */
@@ -36,6 +53,14 @@ export interface AIProvider {
     maxTokens?: number;
     images?: GenerationImage[];
   }): Promise<T>;
+
+  /**
+   * Verbatim text of a photographed or scanned document page — OCR, not
+   * interpretation. A dedicated OCR model transcribes exactly what is printed; a
+   * general vision model asked to "transcribe and summarise" in one pass misread
+   * reference ranges and took ~40 s. Summarising is a separate `generate` call.
+   */
+  transcribe(image: GenerationImage): Promise<string>;
 
   /** Latency + token usage, for the `AiInteraction` log. */
   lastUsage(): { latencyMs?: number; tokensUsed?: number };

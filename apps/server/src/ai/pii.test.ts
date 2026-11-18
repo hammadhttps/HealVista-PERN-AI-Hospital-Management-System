@@ -72,3 +72,38 @@ describe("stripPII", () => {
     expect(stripPII(null as unknown as string)).toBe(null as unknown as string);
   });
 });
+
+describe("stripPII — regressions from live testing", () => {
+  it("redacts the actual patient's name when the caller passes it", () => {
+    const out = stripPII("Alex Johnson reports headache. Johnson was seen last week.", {
+      knownNames: ["Alex Johnson"],
+    });
+    expect(out).not.toMatch(/Alex|Johnson/);
+    expect(out).toContain("reports headache");
+  });
+
+  it("redacts regional given names and surnames even without the record", () => {
+    const out = stripPII("Seen with Ayesha Siddiqui and her son Bilal.");
+    expect(out).not.toMatch(/Ayesha|Siddiqui|Bilal/);
+  });
+
+  it("does not redact lower-case clinical words after a label or salutation", () => {
+    expect(stripPII("Patient: reports headache for two days.")).toBe(
+      "Patient: reports headache for two days.",
+    );
+    expect(stripPII("QT interval 440 ms prolonged. Miss dose of metformin yesterday.")).toContain(
+      "prolonged. Miss dose of metformin",
+    );
+  });
+
+  it("keeps record numbers intact for citations", () => {
+    expect(stripPII("Lab order LAB-2026-000123 verified")).toContain("LAB-2026-000123");
+    expect(stripPII("Reach 0300 1234567 today")).toContain(T.REDACTED_PHONE);
+  });
+
+  it("keeps clinical words that are also surnames elsewhere", () => {
+    const out = stripPII("White cell count normal. Burns on the left forearm.");
+    expect(out).toContain("White cell count");
+    expect(out).toContain("Burns on the left");
+  });
+});

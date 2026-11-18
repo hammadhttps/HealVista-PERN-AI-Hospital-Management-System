@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { assistant, timelineSummary, semanticSearch, semanticSearchAll } from "./rag.service.js";
 import { isAiConfigured } from "./index.js";
-import { resolveRetrievalScope, retrieve } from "./retrieval.js";
+import {
+  keywordRetrieve,
+  resolveRetrievalScope,
+  retrieve,
+  retrieveWithFallback,
+} from "./retrieval.js";
 import { getCached, setCached } from "../config/redis.js";
 import { logInteraction } from "./aiInteraction.service.js";
 import { AiGenerationError } from "./guardrails.js";
@@ -17,10 +22,19 @@ vi.mock("./index.js", () => ({
   isAiConfigured: vi.fn(),
 }));
 
-vi.mock("./retrieval.js", () => ({
-  resolveRetrievalScope: vi.fn(),
-  retrieve: vi.fn(),
-}));
+vi.mock("./retrieval.js", () => {
+  const retrieve = vi.fn();
+  return {
+    resolveRetrievalScope: vi.fn(),
+    retrieve,
+    keywordRetrieve: vi.fn(),
+    // The real wrapper: vector search first, keyword search if it throws.
+    retrieveWithFallback: vi.fn(async (...args: unknown[]) => ({
+      chunks: await retrieve(...args),
+      degraded: false,
+    })),
+  };
+});
 
 vi.mock("./aiInteraction.service.js", () => ({ logInteraction: vi.fn() }));
 
@@ -78,6 +92,7 @@ beforeEach(() => {
   vi.mocked(isAiConfigured).mockReturnValue(true);
   vi.mocked(getCached).mockResolvedValue(null);
   vi.mocked(retrieve).mockResolvedValue(chunks as never);
+  vi.mocked(keywordRetrieve).mockResolvedValue(chunks as never);
   vi.mocked(prisma.patient.findMany).mockResolvedValue([
     { id: "p1", fullName: "Ana Doe", mrn: "MRN1" },
   ] as never);
@@ -168,14 +183,61 @@ describe("assistant", () => {
     expect(mockGenerate).not.toHaveBeenCalled();
   });
 
-  it("returns an unavailable marker when AI is not configured", async () => {
-    vi.mocked(isAiConfigured).mockReturnValue(false);
+  it("still returns matching excerpts when the AI provider is down", async () => {
+    // Embeddings failed → keyword retrieval; generation failed → excerpts verbatim.
+    vi.mocked(retrieveWithFallback).mockResolvedValueOnce({
+      chunks: chunks as never,
+      degraded: true,
+    });
+    mockGenerate.mockRejectedValue(new AiGenerationError("provider down", 503));
 
     const result = await assistant("what medicines am I on?", patientActor);
 
     expect(result.fallback).toBe(true);
-    expect(mockGenerate).not.toHaveBeenCalled();
-    expect(retrieve).not.toHaveBeenCalled();
+    expect(result.answer).toContain("Aspirin");
+  });
+
+  it("redacts the in-scope patient's name from the question before it leaves", async () => {
+    vi.mocked(resolveRetrievalScope).mockResolvedValue({ patientIds: ["p1"] } as never);
+    mockGenerate.mockResolvedValue({ answer: "You are on Aspirin." });
+
+    await assistant("what is Ana Doe taking?", patientActor);
+
+    expect(retrieve).toHaveBeenCalledWith(
+      "what is [NAME] [NAME] taking?",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("rejects an answer that calls flagged results normal", async () => {
+    // Regression: the doctor assistant once said "all within normal ranges" over an
+    // excerpt marked [CRITICAL]. The excerpts themselves are shown instead.
+    vi.mocked(resolveRetrievalScope).mockResolvedValue({ patientIds: ["p1"] } as never);
+    vi.mocked(retrieve).mockResolvedValue([
+      {
+        ...chunks[0],
+        content: "CBC Complete Blood Count: 6.8 [CRITICAL]",
+        sourceType: "lab_report",
+      },
+    ] as never);
+    mockGenerate.mockResolvedValue({ answer: "All of the recent labs are within normal ranges." });
+
+    const result = await assistant("how are the labs?", doctorActor, "p1");
+
+    expect(result.fallback).toBe(true);
+    expect(result.answer).toContain("[CRITICAL]");
+    expect(result.answer).not.toMatch(/within normal/);
+  });
+
+  it("never shows a patient an answer that names a condition", async () => {
+    mockGenerate.mockResolvedValue({ answer: "Your glucose suggests you may have diabetes." });
+
+    const result = await assistant("is my sugar ok?", patientActor);
+
+    expect(result.fallback).toBe(true);
+    expect(result.answer).not.toMatch(/diabetes/i);
+    expect(mockGenerate).toHaveBeenCalledTimes(2); // one corrective retry, then the fallback
   });
 
   it("falls back to retrieved excerpts when generation fails", async () => {
@@ -263,15 +325,20 @@ describe("semanticSearch", () => {
     });
   });
 
-  it("returns empty results when AI is unconfigured", async () => {
+  it("falls back to a scoped keyword search when AI is unconfigured", async () => {
     vi.mocked(resolveRetrievalScope).mockResolvedValue({ patientIds: ["p1"] } as never);
     vi.mocked(isAiConfigured).mockReturnValue(false);
 
-    const result = await semanticSearch("x", "p1", doctorActor);
+    const result = await semanticSearch("aspirin", "p1", doctorActor);
 
     expect(result.fallback).toBe(true);
-    expect(result.results).toEqual([]);
+    expect(result.results).toHaveLength(3);
     expect(retrieve).not.toHaveBeenCalled();
+    expect(keywordRetrieve).toHaveBeenCalledWith(
+      "aspirin",
+      { patientIds: ["p1"] },
+      expect.anything(),
+    );
   });
 });
 
@@ -306,14 +373,18 @@ describe("semanticSearchAll", () => {
     expect(retrieve).not.toHaveBeenCalled();
   });
 
-  it("returns empty results when AI is unconfigured", async () => {
+  it("falls back to a scoped keyword search when AI is unconfigured", async () => {
     vi.mocked(resolveRetrievalScope).mockResolvedValue({ patientIds: ["p1"] } as never);
     vi.mocked(isAiConfigured).mockReturnValue(false);
 
-    const result = await semanticSearchAll("anything", doctorActor);
+    const result = await semanticSearchAll("aspirin", doctorActor);
 
     expect(result.fallback).toBe(true);
-    expect(result.results).toEqual([]);
     expect(retrieve).not.toHaveBeenCalled();
+    expect(keywordRetrieve).toHaveBeenCalledWith(
+      "aspirin",
+      { patientIds: ["p1"] },
+      expect.anything(),
+    );
   });
 });

@@ -1,4 +1,5 @@
 import { prisma, prismaDirect } from "../config/db.js";
+import { canSeeResults } from "./labVisibility.js";
 import { AppError } from "../utils/AppError.js";
 import { writeAuditLog } from "../utils/audit.js";
 import { addEmbeddingJob } from "../config/bull.js";
@@ -478,17 +479,8 @@ export async function verifyOrder(orderId: string, actor: Actor) {
 
 // ─── Reads ──────────────────────────────────────────────────────────────────
 
-/**
- * Whether this actor may see result values on this order.
- *
- * Patients (and their guardians) see nothing until VERIFIED. Clinicians and lab staff
- * see results as soon as they exist — acting on an unverified critical value is the
- * whole point of alerting them.
- */
-export function canSeeResults(actorRole: string, status: string): boolean {
-  if (actorRole === "PATIENT") return status === "VERIFIED";
-  return true;
-}
+// `canSeeResults` lives in labVisibility.ts so the AI explainer can share it.
+export { canSeeResults } from "./labVisibility.js";
 
 /** Strips result values from an order the caller may see the existence but not the content of. */
 function redactResults<T extends { items: unknown[]; status: string }>(order: T): T {

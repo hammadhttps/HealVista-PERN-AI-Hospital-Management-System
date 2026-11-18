@@ -2,6 +2,7 @@ import { Router } from "express";
 import { authenticate } from "../middlewares/auth.middleware.js";
 import { requireRole } from "../middlewares/rbac.middleware.js";
 import { validate } from "../middlewares/validate.middleware.js";
+import { aiRateLimit } from "../ai/aiRateLimit.middleware.js";
 import {
   symptomCheckSchema,
   assistantQuerySchema,
@@ -19,27 +20,38 @@ import * as ai from "../controllers/ai.controller.js";
 /**
  * AI routes (Phase 5).
  *
- * Rate limiting has been temporarily removed while the RAG pipeline is stabilised
- * (see the git history / roadmap). Re-introduce `aiRateLimit` per user before
- * production traffic — the provider's requests-per-minute cap is a shared resource
- * and one user hammering it can exhaust it for everyone. Queued features (report
- * summaries) live on BullMQ workers, not here.
+ * Every route that reaches the model is rate limited per user: the provider's
+ * requests-per-minute cap is shared, and one user hammering it would exhaust it for
+ * everyone. Generation is the expensive tier; retrieval-only search is cheaper and
+ * gets a looser limit. Cache reads and KB administration are not limited.
  *
  * Ownership is enforced in the services, not by role: every `:id` route resolves
  * the caller's relationship to that id before any model call.
  */
 const router = Router();
 
-router.post("/symptom-check", authenticate, validate(symptomCheckSchema), ai.checkSymptom);
+/** Generation: each call is one or two model round trips. */
+const generate = aiRateLimit(30, 10 * 60 * 1000);
+/** Retrieval-only search: one embedding call, no generation. */
+const search = aiRateLimit(60, 10 * 60 * 1000);
 
-router.post("/lab/:orderId/explain", authenticate, ai.explainLab);
+router.post(
+  "/symptom-check",
+  authenticate,
+  generate,
+  validate(symptomCheckSchema),
+  ai.checkSymptom,
+);
 
-router.post("/prescriptions/:id/explain", authenticate, ai.explainPrescription);
+router.post("/lab/:orderId/explain", authenticate, generate, ai.explainLab);
+
+router.post("/prescriptions/:id/explain", authenticate, generate, ai.explainPrescription);
 
 router.post(
   "/appointments/:appointmentId/follow-up",
   authenticate,
   requireRole("DOCTOR"),
+  generate,
   ai.recommendFollowUp,
 );
 
@@ -48,24 +60,26 @@ router.post(
 router.post(
   "/appointments/:appointmentId/assist",
   authenticate,
+  generate,
   validate(appointmentAssistSchema),
   ai.assistAppointment,
 );
 
-router.post("/records/:recordId/ocr", authenticate, ai.ocrRecord);
+router.post("/records/:recordId/ocr", authenticate, generate, ai.ocrRecord);
 
 // Reading a stored summary is cheap and needs no rate limit — it is a cache read.
 router.get("/records/:recordId/summary", authenticate, ai.getRecordSummary);
 
-router.post("/records/:recordId/summarize", authenticate, ai.summarizeRecord);
+router.post("/records/:recordId/summarize", authenticate, generate, ai.summarizeRecord);
 
 // ─── RAG: assistant, timeline, semantic search ─────────────────────────────
 
-router.post("/assistant", authenticate, validate(assistantQuerySchema), ai.assistant);
+router.post("/assistant", authenticate, generate, validate(assistantQuerySchema), ai.assistant);
 
 router.get(
   "/timeline-summary/:patientId",
   authenticate,
+  generate,
   validate(timelineSummaryParamsSchema, "params"),
   ai.timelineSummary,
 );
@@ -74,6 +88,7 @@ router.post(
   "/search",
   authenticate,
   requireRole("DOCTOR"),
+  search,
   validate(semanticSearchSchema),
   ai.semanticSearch,
 );
@@ -82,6 +97,7 @@ router.post(
   "/search-all",
   authenticate,
   requireRole("DOCTOR"),
+  search,
   validate(semanticSearchAllSchema),
   ai.semanticSearchAll,
 );
@@ -94,7 +110,7 @@ router.post(
 
 router.get("/kb", authenticate, ai.kbList);
 
-router.post("/kb/ask", authenticate, validate(kbAskSchema), ai.kbAsk);
+router.post("/kb/ask", authenticate, generate, validate(kbAskSchema), ai.kbAsk);
 
 router.get("/kb/:id", authenticate, ai.kbGet);
 
@@ -116,6 +132,7 @@ router.post(
   "/analytics",
   authenticate,
   requireRole("ADMIN"),
+  generate,
   validate(analyticsQuerySchema),
   ai.analytics,
 );

@@ -2,13 +2,14 @@ import { z } from "zod";
 import { prisma } from "../config/db.js";
 import { AppError } from "../utils/AppError.js";
 import {
+  keywordRetrieve,
   resolveRetrievalScope,
-  retrieve,
+  retrieveWithFallback,
   type RetrievalScope,
   type RetrievedChunk,
 } from "./retrieval.js";
 import { getProvider, isAiConfigured } from "./index.js";
-import { generateValidated, AiGenerationError } from "./guardrails.js";
+import { generateValidated, AiGenerationError, noDiagnosis } from "./guardrails.js";
 import { stripPII } from "./pii.js";
 import { logInteraction } from "./aiInteraction.service.js";
 import { answerCacheKey, getCachedAnswer, setCachedAnswer } from "./answerCache.js";
@@ -59,8 +60,74 @@ function buildCitations(chunks: RetrievedChunk[]): Citation[] {
 }
 
 const assistantOutputSchema = z.object({
-  answer: z.string().min(1).max(2000),
+  answer: z.string().min(1).max(4000),
 });
+
+const FLAG_RE = /\[(HIGH|LOW|CRITICAL|ABNORMAL)\]/gi;
+const ALL_NORMAL_RE =
+  /\b(?:all|everything|every (?:result|value|test))\b[^.]{0,60}\b(?:normal|fine|healthy|unremarkable)\b|\bno (?:abnormal\w*|concerning (?:results?|values?)|flags?)\b/i;
+
+/**
+ * Rejects an answer that misstates the flags in the excerpts it was given.
+ *
+ * In testing the doctor assistant answered "the recent lab abnormalities are all
+ * within normal ranges" over an excerpt marked [CRITICAL]. A summary that drops or
+ * contradicts a flag is worse than no summary, so: never call flagged results
+ * normal, and (when `mustSurfaceCritical`) never leave a CRITICAL result out.
+ */
+export function flagConsistencyProblem(
+  answer: string,
+  chunks: RetrievedChunk[],
+  mustSurfaceCritical: boolean,
+): string | null {
+  const flags = new Set(
+    chunks.flatMap((c) => [...c.content.matchAll(FLAG_RE)].map((m) => m[1].toUpperCase())),
+  );
+  if (flags.size === 0) return null;
+  if (ALL_NORMAL_RE.test(answer)) {
+    return `It describes the results as normal, but the excerpts flag some as ${[...flags].join(", ")}. Report each flag exactly as the excerpt states it.`;
+  }
+  if (mustSurfaceCritical && flags.has("CRITICAL") && !/critical/i.test(answer)) {
+    return "It leaves out a result the excerpts flag as CRITICAL. Every CRITICAL result must be mentioned.";
+  }
+  return null;
+}
+
+/**
+ * Lines the records themselves flag CRITICAL, listed ahead of a generated summary.
+ *
+ * Asked to "mention every CRITICAL result", the model still left them out. A
+ * summary of someone's history that omits a critical value is worse than none, so
+ * the critical lines are copied from the records verbatim — never generated.
+ */
+export function withCriticalPreamble(summary: string, chunks: RetrievedChunk[]): string {
+  const critical = [
+    ...new Set(
+      chunks.flatMap((c) =>
+        c.content
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => /\[CRITICAL\]/i.test(line)),
+      ),
+    ),
+  ];
+  if (critical.length === 0) return summary;
+  const list = critical.map((line) => `• ${line}`).join("\n");
+  return `Flagged CRITICAL in the records:\n${list}\n\n${summary}`;
+}
+
+/** The checks an assistant answer must pass, by audience. */
+function answerChecks(
+  actor: Actor,
+  chunks: RetrievedChunk[],
+  mustSurfaceCritical: boolean,
+): (text: string) => string | null {
+  return (text) =>
+    flagConsistencyProblem(text, chunks, mustSurfaceCritical) ??
+    // A patient reads the answer as advice; a doctor reading their own notes back
+    // is reading diagnoses that a clinician wrote, which are not the AI's to censor.
+    (actor.role === "PATIENT" ? noDiagnosis(text) : null);
+}
 
 const NO_RESULTS_ANSWER =
   "I couldn't find anything in the records that covers this. If you think a record should exist, ask your care team.";
@@ -71,11 +138,16 @@ async function buildAssistantAnswer(
   actor: Actor,
   feature: string,
 ): Promise<AssistantResult> {
-  const chunks = await retrieve(question, scope, { k: 8, minSimilarity: 0.3, actor, feature });
+  const { chunks, degraded } = await retrieveWithFallback(question, scope, {
+    k: 8,
+    minSimilarity: 0.3,
+    actor,
+    feature,
+  });
 
   if (chunks.length === 0) {
-    await logInteraction({ userId: actor.userId, feature, question, wasFallback: false });
-    return { answer: NO_RESULTS_ANSWER, citations: [], fallback: false };
+    await logInteraction({ userId: actor.userId, feature, question, wasFallback: degraded });
+    return { answer: NO_RESULTS_ANSWER, citations: [], fallback: degraded };
   }
 
   const citations = buildCitations(chunks);
@@ -94,8 +166,9 @@ async function buildAssistantAnswer(
       prompt: `Question from the user:\n"${stripPII(question)}"\n\nRelevant record excerpts:\n${context}`,
       schema: assistantOutputSchema,
       system:
-        "Answer the question using ONLY the record excerpts provided. If the excerpts do not answer it, say so. Cite the records you used by their [source] markers. Do not give general medical advice beyond the records. Answer in the same language the user asked in. Prefer short paragraphs and bullet points.",
-      maxTokens: 512,
+        "Answer the question using ONLY the record excerpts provided. If the excerpts do not answer it, say so. Report any [HIGH], [LOW] or [CRITICAL] flag exactly as written — never describe a flagged value as normal. Cite the records you used by their [source] markers. Do not give general medical advice beyond the records. Answer in the same language the user asked in. Prefer short paragraphs and bullet points.",
+      maxTokens: 700,
+      check: (out) => answerChecks(actor, chunks, false)(out.answer),
     });
 
     const usage = getProvider().lastUsage();
@@ -107,10 +180,10 @@ async function buildAssistantAnswer(
       citedChunks: chunks.map((c) => c.id),
       latencyMs: usage.latencyMs,
       tokensUsed: usage.tokensUsed,
-      wasFallback: false,
+      wasFallback: degraded,
     });
 
-    return { answer: result.answer, citations, fallback: false };
+    return { answer: result.answer, citations, fallback: degraded };
   } catch (err) {
     if (!(err instanceof AiGenerationError)) throw err;
     await logInteraction({ userId: actor.userId, feature, question, wasFallback: true });
@@ -137,15 +210,19 @@ async function runAssistant(
   const cached = await getCachedAnswer<AssistantResult>(cacheKey);
   if (cached) return cached;
 
-  if (!isAiConfigured()) {
-    return {
-      answer: "The AI assistant is not available right now.",
-      citations: [],
-      fallback: true,
-    };
-  }
+  // People type their own (or their child's) name into questions. The question is
+  // embedded and sent to the provider, so the names of everyone in scope are
+  // redacted first — not just the ones a word list happens to know.
+  const patients = await prisma.patient.findMany({
+    where: { id: { in: scope.patientIds.slice(0, 20) } },
+    select: { fullName: true },
+  });
+  const safeQuestion = stripPII(question, { knownNames: patients.map((p) => p.fullName) });
 
-  const result = await buildAssistantAnswer(question, scope, actor, feature);
+  // No early "AI unavailable" return: without a key, retrieval falls back to a
+  // keyword search and generation to the excerpts themselves, so the caller still
+  // gets the matching records.
+  const result = await buildAssistantAnswer(safeQuestion, scope, actor, feature);
   if (!result.fallback) await setCachedAnswer(cacheKey, result);
   return result;
 }
@@ -203,7 +280,7 @@ export async function assistant(
 }
 
 const timelineOutputSchema = z.object({
-  summary: z.string().min(1).max(2000),
+  summary: z.string().min(1).max(4000),
 });
 
 export interface TimelineSummaryResult {
@@ -232,7 +309,13 @@ export async function timelineSummary(
   await assertPatientInScope(patientId, actor);
 
   const feature = "timeline-summary";
-  const cacheKey = answerCacheKey(feature, patientId);
+  // Audience is part of the key: the patient's summary passes the no-diagnosis
+  // check, the clinician's does not, so they are not interchangeable.
+  const cacheKey = answerCacheKey(
+    feature,
+    patientId,
+    actor.role === "PATIENT" ? "patient" : "clinician",
+  );
   const cached = await getCachedAnswer<TimelineSummaryResult>(cacheKey);
   if (cached) return cached;
 
@@ -246,18 +329,18 @@ export async function timelineSummary(
 
   const question =
     "Summarise this patient's recent medical history: what happened across their visits, prescriptions, lab results, and reports, in order.";
-  const chunks = await retrieve(
+  const { chunks, degraded } = await retrieveWithFallback(
     question,
     { patientIds: [patientId] },
     { k: 10, minSimilarity: 0.28, actor, feature },
   );
 
   if (chunks.length === 0) {
-    await logInteraction({ userId: actor.userId, feature, question, wasFallback: false });
+    await logInteraction({ userId: actor.userId, feature, question, wasFallback: degraded });
     return {
       summary: "No clinical records found for this patient yet.",
       citations: [],
-      fallback: false,
+      fallback: degraded,
     };
   }
 
@@ -274,8 +357,9 @@ export async function timelineSummary(
       prompt: `Relevant record excerpts for one patient:\n${context}\n\nProduce a concise chronological summary of the patient's recent history. If a topic is not covered by the excerpts, do not invent it.`,
       schema: timelineOutputSchema,
       system:
-        "Summarise ONLY what the excerpts contain. Do not diagnose. Note gaps rather than filling them. Answer in the same language the user asked in. Prefer short paragraphs and bullet points.",
-      maxTokens: 512,
+        "Summarise ONLY what the excerpts contain. Do not diagnose and do not recommend actions the records do not state. Mention every [CRITICAL] result and report every flag exactly as written. Note gaps rather than filling them. Answer in the same language the user asked in. Prefer short paragraphs and bullet points.",
+      maxTokens: 700,
+      check: (out) => answerChecks(actor, chunks, false)(out.summary),
     });
 
     const usage = getProvider().lastUsage();
@@ -287,11 +371,15 @@ export async function timelineSummary(
       citedChunks: chunks.map((c) => c.id),
       latencyMs: usage.latencyMs,
       tokensUsed: usage.tokensUsed,
-      wasFallback: false,
+      wasFallback: degraded,
     });
 
-    const out: TimelineSummaryResult = { summary: result.summary, citations, fallback: false };
-    await setCachedAnswer(cacheKey, out);
+    const out: TimelineSummaryResult = {
+      summary: withCriticalPreamble(result.summary, chunks),
+      citations,
+      fallback: degraded,
+    };
+    if (!degraded) await setCachedAnswer(cacheKey, out);
     return out;
   } catch (err) {
     if (!(err instanceof AiGenerationError)) throw err;
@@ -326,22 +414,20 @@ export async function semanticSearch(
 ): Promise<{ results: SearchHit[]; fallback: boolean }> {
   await assertPatientInScope(patientId, actor);
 
-  if (!isAiConfigured()) {
-    return { results: [], fallback: true };
-  }
-
-  const chunks = await retrieve(
-    query,
-    { patientIds: [patientId] },
-    { k, minSimilarity: 0.35, actor, feature: "semantic-search" },
-  );
+  const scope = { patientIds: [patientId] };
+  const opts = { k, minSimilarity: 0.35, actor, feature: "semantic-search" };
+  // Unconfigured or failing embeddings degrade to a scoped keyword search — the
+  // doctor still gets matches, never an empty page or a 502.
+  const { chunks, degraded } = isAiConfigured()
+    ? await retrieveWithFallback(query, scope, opts)
+    : { chunks: await keywordRetrieve(query, scope, opts), degraded: true };
 
   await logInteraction({
     userId: actor.userId,
     feature: "semantic-search",
     question: query,
     citedChunks: chunks.map((c) => c.id),
-    wasFallback: false,
+    wasFallback: degraded,
   });
 
   return {
@@ -354,7 +440,7 @@ export async function semanticSearch(
       chunkIndex: c.chunkIndex,
       similarity: c.similarity,
     })),
-    fallback: false,
+    fallback: degraded,
   };
 }
 
@@ -379,23 +465,17 @@ export async function semanticSearchAll(
     return { results: [], fallback: false };
   }
 
-  if (!isAiConfigured()) {
-    return { results: [], fallback: true };
-  }
-
-  const chunks = await retrieve(query, scope, {
-    k,
-    minSimilarity: 0.35,
-    actor,
-    feature: "semantic-search-all",
-  });
+  const opts = { k, minSimilarity: 0.35, actor, feature: "semantic-search-all" };
+  const { chunks, degraded } = isAiConfigured()
+    ? await retrieveWithFallback(query, scope, opts)
+    : { chunks: await keywordRetrieve(query, scope, opts), degraded: true };
 
   await logInteraction({
     userId: actor.userId,
     feature: "semantic-search-all",
     question: query,
     citedChunks: chunks.map((c) => c.id),
-    wasFallback: false,
+    wasFallback: degraded,
   });
 
   const patientIds = [...new Set(chunks.map((c) => c.patientId).filter(Boolean))] as string[];
@@ -416,6 +496,6 @@ export async function semanticSearchAll(
       chunkIndex: c.chunkIndex,
       similarity: c.similarity,
     })),
-    fallback: false,
+    fallback: degraded,
   };
 }

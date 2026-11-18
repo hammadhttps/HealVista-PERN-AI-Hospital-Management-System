@@ -4,7 +4,7 @@ import { AppError } from "../utils/AppError.js";
 import { writeAuditLog } from "../utils/audit.js";
 import { addEmbeddingJob } from "../config/bull.js";
 import { deleteChunksForSource } from "./embeddings.service.js";
-import { retrieve } from "./retrieval.js";
+import { keywordTerms, retrieveWithFallback } from "./retrieval.js";
 import { getProvider, isAiConfigured } from "./index.js";
 import { generateValidated, AiGenerationError } from "./guardrails.js";
 import { stripPII } from "./pii.js";
@@ -174,10 +174,12 @@ async function keywordKbSearch(question: string, limit: number) {
   return prisma.kbArticle.findMany({
     where: {
       isPublished: true,
-      OR: [
-        { title: { contains: question, mode: "insensitive" } },
-        { content: { contains: question, mode: "insensitive" } },
-      ],
+      // Matching the whole question as one substring ("when are visiting hours?")
+      // almost never hit. Any distinctive word of it is what a reader would search.
+      OR: (keywordTerms(question).length ? keywordTerms(question) : [question]).flatMap((term) => [
+        { title: { contains: term, mode: "insensitive" as const } },
+        { content: { contains: term, mode: "insensitive" as const } },
+      ]),
     },
     take: limit,
     orderBy: { updatedAt: "desc" },
@@ -204,10 +206,10 @@ export async function askKb(question: string, actor: Actor): Promise<KbAskResult
     };
   }
 
-  const chunks = await retrieve(
+  const { chunks } = await retrieveWithFallback(
     question,
     { patientIds: [] },
-    { k: 6, minSimilarity: 0.3, kbOnly: true },
+    { k: 6, minSimilarity: 0.3, kbOnly: true, feature },
   );
 
   if (chunks.length === 0) {

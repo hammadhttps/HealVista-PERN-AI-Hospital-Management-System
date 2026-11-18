@@ -145,7 +145,21 @@ export async function assertCanAccessBill(billId: string, actor: Actor) {
 
 const billInclude = {
   items: true,
-  payments: { orderBy: { createdAt: "desc" } },
+  // Money movements only. Abandoned and declined card attempts move no money, and
+  // one bill had accumulated thousands of them — every read of it carried them all.
+  payments: { where: { status: { not: "FAILED" } }, orderBy: { createdAt: "desc" } },
+  discount: true,
+  patient: { select: { id: true, fullName: true, mrn: true } },
+  appointment: { select: { id: true, appointmentNo: true } },
+} satisfies Prisma.BillInclude;
+
+/**
+ * The list shape: everything the billing tables render, without payment rows.
+ * Including every payment of every bill made the staff list ~1 MB and 7–21 s; the
+ * payment history has its own paginated endpoint.
+ */
+const billListInclude = {
+  items: true,
   discount: true,
   patient: { select: { id: true, fullName: true, mrn: true } },
   appointment: { select: { id: true, appointmentNo: true } },
@@ -574,7 +588,7 @@ export async function getBills(filters: ListBillsInput, actor: Actor) {
   const [bills, total] = await Promise.all([
     prisma.bill.findMany({
       where,
-      include: billInclude,
+      include: billListInclude,
       orderBy: { createdAt: "desc" },
       skip: (page - 1) * limit,
       take: limit,

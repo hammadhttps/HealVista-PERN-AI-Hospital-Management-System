@@ -8,6 +8,7 @@ import swaggerUi from "swagger-ui-express";
 import { isOriginAllowed } from "./config/cors.js";
 import { errorHandler } from "./middlewares/error.middleware.js";
 import { logger } from "./utils/logger.js";
+import { dbQueryCounter } from "./config/queryCounter.js";
 import authRoutes from "./routes/auth.routes.js";
 import departmentRoutes from "./routes/department.routes.js";
 import settingsRoutes from "./routes/settings.routes.js";
@@ -94,9 +95,26 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Request logging
-app.use((req, _res, next) => {
-  logger.info({ method: req.method, url: req.url, correlationId: req.correlationId }, "request");
+// Request logging — one line per request, written when it finishes, carrying the
+// status and duration (and, with LOG_DB_QUERY_COUNT=true, the number of DB queries).
+// Slow requests log at warn so they stand out in the host's log stream.
+const SLOW_REQUEST_MS = 1500;
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  const queriesAtStart = dbQueryCounter.value;
+  res.on("finish", () => {
+    const ms = Math.round(Number(process.hrtime.bigint() - start) / 1e6);
+    const entry = {
+      method: req.method,
+      url: req.originalUrl,
+      status: res.statusCode,
+      ms,
+      ...(dbQueryCounter.enabled ? { dbQueries: dbQueryCounter.value - queriesAtStart } : {}),
+      correlationId: req.correlationId,
+    };
+    if (ms >= SLOW_REQUEST_MS) logger.warn(entry, "slow request");
+    else logger.info(entry, "request");
+  });
   next();
 });
 

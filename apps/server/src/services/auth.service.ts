@@ -1,6 +1,7 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto, { randomUUID } from "crypto";
+import type { Prisma } from "@prisma/client";
 import { prisma } from "../config/db.js";
 import { env } from "../config/env.js";
 import { AppError } from "../utils/AppError.js";
@@ -285,20 +286,49 @@ export async function logoutAll(userId: string) {
   });
 }
 
+/** The one profile relation each role has. Admin has none. */
+const PROFILE_BY_ROLE = {
+  PATIENT: "patient",
+  DOCTOR: "doctor",
+  RECEPTIONIST: "receptionist",
+  PHARMACIST: "pharmacist",
+  LAB_TECHNICIAN: "labTechnician",
+  ACCOUNTANT: "accountant",
+} as const;
+
+const NO_PROFILES = {
+  patient: null,
+  doctor: null,
+  receptionist: null,
+  pharmacist: null,
+  labTechnician: null,
+  accountant: null,
+};
+
+/**
+ * The signed-in user with their role profile — fetched on every page load.
+ *
+ * It used to include all six profile relations, which Prisma loads as six extra
+ * queries (seven per call) to find the single one a user can have. Including only
+ * the role's relation is two; the other keys stay `null` so the shape the client
+ * reads is unchanged.
+ */
 export async function getMe(userId: string) {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    include: {
-      patient: true,
-      doctor: true,
-      receptionist: true,
-      pharmacist: true,
-      labTechnician: true,
-      accountant: true,
-    },
-  });
+  const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user) throw new AppError("User not found", 404);
-  return user;
+
+  const relation = PROFILE_BY_ROLE[user.role as keyof typeof PROFILE_BY_ROLE];
+  if (!relation) return { ...user, ...NO_PROFILES };
+
+  const withProfile = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { [relation]: true } as Prisma.UserSelect,
+  });
+  return {
+    ...user,
+    ...NO_PROFILES,
+    [relation]: (withProfile as Record<string, unknown> | null)?.[relation] ?? null,
+  };
 }
 
 export async function verifyEmail(token: string) {

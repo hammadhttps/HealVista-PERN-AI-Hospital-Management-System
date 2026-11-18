@@ -104,6 +104,31 @@ export interface LabExplainResult {
   fallback: boolean;
 }
 
+/** Prescription explanation. `howToTake` is the prescription itself, never AI-written. */
+export interface RxExplainResult {
+  purpose: string | null;
+  howToTake: string | null;
+  sideEffects: string[];
+  lifestyleNotes: string[];
+  warnings: string[];
+  fallback: boolean;
+}
+
+/** Doctor-facing follow-up suggestion — a suggestion the doctor applies or ignores. */
+export interface FollowUpResult {
+  intervalDays: number | null;
+  instructions: string | null;
+  rationale: string | null;
+  fallback: boolean;
+}
+
+/** OCR of a photographed record: verbatim transcription plus a checked summary. */
+export interface OcrResult {
+  extractedText: string | null;
+  summary: string | null;
+  fallback: boolean;
+}
+
 export interface RecordSummary {
   keyValues?: { name: string; value: string; referenceRange: string | null }[];
   flags?: string[];
@@ -153,6 +178,22 @@ export const aiApi = {
   /** Lab report explanation — plain-language, no diagnosis. */
   explainLab: (orderId: string) =>
     api.post<{ data: LabExplainResult }>(`/ai/lab/${orderId}/explain`).then((r) => r.data.data),
+
+  /** Prescription explanation for the patient taking it. */
+  explainPrescription: (prescriptionId: string) =>
+    api
+      .post<{ data: RxExplainResult }>(`/ai/prescriptions/${prescriptionId}/explain`)
+      .then((r) => r.data.data),
+
+  /** Follow-up interval suggestion for the treating doctor's own visit. */
+  recommendFollowUp: (appointmentId: string) =>
+    api
+      .post<{ data: FollowUpResult }>(`/ai/appointments/${appointmentId}/follow-up`)
+      .then((r) => r.data.data),
+
+  /** Reads a photographed record (PNG/JPEG): transcription + plain-language summary. */
+  ocrRecord: (recordId: string) =>
+    api.post<{ data: OcrResult }>(`/ai/records/${recordId}/ocr`).then((r) => r.data.data),
 
   /** Stored report summary, or null when none exists yet. */
   recordSummary: (recordId: string) =>

@@ -33,6 +33,19 @@ export function useExplainLab() {
   return useMutation({ mutationFn: aiApi.explainLab });
 }
 
+export function useExplainPrescription() {
+  return useMutation({ mutationFn: aiApi.explainPrescription });
+}
+
+/** A suggestion only — applying it is the doctor's own edit to the prescription form. */
+export function useRecommendFollowUp() {
+  return useMutation({ mutationFn: aiApi.recommendFollowUp });
+}
+
+export function useOcrRecord() {
+  return useMutation({ mutationFn: aiApi.ocrRecord });
+}
+
 export function useSummarizeRecord(recordId: string) {
   const queryClient = useQueryClient();
   return useMutation({

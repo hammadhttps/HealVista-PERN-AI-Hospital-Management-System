@@ -101,7 +101,11 @@ export const prescriptionApi = {
     api.put(`/prescriptions/${id}`, data).then((r) => r.data.data),
   listForPatient: (patientId: string) =>
     api.get(`/patients/${patientId}/prescriptions`).then((r) => r.data.data),
-  pdfUrl: (id: string) => `/api/prescriptions/${id}/pdf`,
+  /** The prescription PDF, fetched with the session's credentials. */
+  downloadPdf: async (id: string): Promise<Blob> => {
+    const res = await api.get(`/prescriptions/${id}/pdf`, { responseType: "blob" });
+    return res.data as Blob;
+  },
 
   listFavourites: () => api.get("/prescription-favourites").then((r) => r.data.data),
   saveFavourite: (data: { name: string; items: unknown[] }) =>

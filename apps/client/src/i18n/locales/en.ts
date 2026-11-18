@@ -262,6 +262,7 @@ const en = {
     chat: "Chat",
     account: "Account",
     knowledgeBase: "Knowledge Base",
+    myPrescriptions: "My Prescriptions",
   },
 
   profile: {
@@ -400,6 +401,7 @@ const en = {
     finalise: "Finalise bill",
     cashPlaceholder: "Max {{max}}",
     invoicePdf: "Invoice PDF",
+    invoiceFailed: "Could not download the invoice.",
     payCard: "Pay card",
     paymentSubmitted: "Payment submitted. We will confirm it shortly.",
     paymentFailed: "Could not start the payment.",
@@ -430,6 +432,7 @@ const en = {
     paid: "Paid",
     balanceDue: "Balance due",
     downloadInvoice: "Download invoice",
+    invoiceFailed: "Could not download the invoice.",
   },
 
   booking: {
@@ -701,6 +704,14 @@ const en = {
     autosaving: "Autosaving…",
     autosaved: "Autosaved",
     autosaveFailed: "Autosave failed",
+    myPrescriptionsTitle: "My prescriptions",
+    myPrescriptionsIntro:
+      "Medicines your doctors have prescribed, exactly as written. Ask for a plain-language explanation of any of them.",
+    noPrescriptions: "No prescriptions yet",
+    noPrescriptionsHint: "Prescriptions your doctor issues after a visit will appear here.",
+    loadFailed: "Could not load your prescriptions.",
+    pdfFailed: "Could not download the prescription.",
+    itemLine: "{{dosage}}, {{frequency}} for {{days}} day(s)",
   },
 
   pharmacy: {
@@ -995,6 +1006,26 @@ const en = {
     factSheet: "Appointment details",
     analysisUnavailable:
       "The AI is unavailable right now — these are the appointment's own details.",
+    explainPrescription: "Explain this prescription",
+    asPrescribed: "As prescribed by your doctor",
+    sideEffects: "Common side effects",
+    lifestyleNotes: "Lifestyle notes",
+    warnings: "Warnings",
+    prescriptionExplainUnavailable:
+      "The AI explanation is unavailable right now — follow the prescription exactly as written above.",
+    suggestFollowUp: "Suggest follow-up (AI)",
+    followUpTitle: "Suggested follow-up",
+    followUpInDays: "Follow up in {{count}} day(s)",
+    rationale: "Why",
+    applyFollowUp: "Apply {{count}} day(s)",
+    followUpUnavailable: "No suggestion is available right now — set the follow-up yourself.",
+    readDocument: "Read this document (AI)",
+    readingDocument: "Reading…",
+    ocrTitle: "What this document says",
+    ocrTranscription: "Text found on the page",
+    ocrSummaryUnavailable:
+      "A plain-language summary is unavailable right now — the text found on the page is below.",
+    ocrUnavailable: "This document could not be read right now. Open the original to view it.",
   },
 
   chat: {

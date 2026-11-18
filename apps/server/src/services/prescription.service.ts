@@ -368,7 +368,13 @@ export async function listForPatient(patientId: string, actor: Actor) {
   await assertClinicalAccess(patientId, actor);
 
   return prisma.prescription.findMany({
-    where: { deletedAt: null, appointment: { patientId } },
+    where: {
+      deletedAt: null,
+      appointment: { patientId },
+      // A draft is the doctor's work in progress, not a prescription. Patients (and
+      // guardians) see only what has been issued.
+      ...(actor.role === "PATIENT" ? { isDraft: false } : {}),
+    },
     include: {
       items: true,
       appointment: {

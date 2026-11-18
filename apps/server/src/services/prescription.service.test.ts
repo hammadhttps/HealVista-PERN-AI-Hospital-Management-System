@@ -10,7 +10,7 @@ vi.mock("../config/db", () => ({
     patientAllergy: { findMany: vi.fn() },
     prescriptionItem: { findMany: vi.fn() },
     drugInteraction: { findMany: vi.fn() },
-    prescription: { create: vi.fn() },
+    prescription: { create: vi.fn(), findMany: vi.fn() },
   },
 }));
 
@@ -176,5 +176,24 @@ describe("createPrescription safety enforcement", () => {
         }),
       }),
     );
+  });
+});
+
+describe("listForPatient", () => {
+  it("never shows a patient the doctor's unissued draft", async () => {
+    const { prisma } = await import("../config/db.js");
+    vi.mocked(prisma.prescription.findMany).mockResolvedValue([] as never);
+    const { listForPatient } = await import("./prescription.service.js");
+
+    await listForPatient("p1", { userId: "u1", role: "PATIENT" });
+    expect(vi.mocked(prisma.prescription.findMany).mock.calls[0][0]).toMatchObject({
+      where: { isDraft: false },
+    });
+
+    vi.mocked(prisma.prescription.findMany).mockClear();
+    await listForPatient("p1", { userId: "d1", role: "DOCTOR" });
+    const where = (vi.mocked(prisma.prescription.findMany).mock.calls[0][0] as { where: object })
+      .where;
+    expect(where).not.toHaveProperty("isDraft");
   });
 });

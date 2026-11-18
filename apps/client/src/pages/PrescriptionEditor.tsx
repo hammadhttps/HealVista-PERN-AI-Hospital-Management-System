@@ -23,6 +23,9 @@ import {
   type SafetyWarning,
 } from "../components/clinical/PrescriptionSafetyPanel";
 import { prescriptionApi } from "../api/clinical";
+import { downloadBlob } from "../lib/downloadBlob";
+import { getErrorMessage } from "../utils/errors";
+import FollowUpSuggestion from "../components/ai/FollowUpSuggestion";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -402,9 +405,17 @@ export default function PrescriptionEditor() {
             <p className="text-emerald-900 dark:text-emerald-100">{t("prescription:issuedBody")}</p>
             <div className="mt-4 flex gap-2">
               <Button
-                render={
-                  <a href={prescriptionApi.pdfUrl(createdId)} target="_blank" rel="noreferrer" />
-                }
+                onClick={async () => {
+                  try {
+                    const blob = await prescriptionApi.downloadPdf(createdId);
+                    downloadBlob(
+                      blob,
+                      `prescription-${appointment?.appointmentNo ?? createdId}.pdf`,
+                    );
+                  } catch (e) {
+                    toast.error(getErrorMessage(e, t("prescription:pdfFailed")));
+                  }
+                }}
               >
                 <FileText className="h-4 w-4" /> {t("prescription:openPdf")}
               </Button>
@@ -568,6 +579,13 @@ export default function PrescriptionEditor() {
                       {...register("followUpAfterDays")}
                     />
                   </div>
+                  {/* AI suggests; the doctor applies it to the field and still issues. */}
+                  <FollowUpSuggestion
+                    appointmentId={appointmentId!}
+                    onApply={(days) =>
+                      setValue("followUpAfterDays", String(days), { shouldDirty: true })
+                    }
+                  />
                 </CardContent>
               </Card>
 

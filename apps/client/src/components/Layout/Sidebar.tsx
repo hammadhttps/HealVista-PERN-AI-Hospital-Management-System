@@ -73,6 +73,7 @@ const roleNav: Record<string, { to: string; key: string; icon: LucideIcon }[]> =
     { to: "/patient/favourites", key: "nav:favourites", icon: Heart },
     { to: "/patient/referrals", key: "nav:referrals", icon: ArrowRightLeft },
     { to: "/patient/records", key: "nav:healthRecords", icon: FileText },
+    { to: "/patient/prescriptions", key: "nav:myPrescriptions", icon: Pill },
     { to: "/patient/bills", key: "nav:myBills", icon: Receipt },
   ],
   RECEPTIONIST: [

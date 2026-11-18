@@ -52,6 +52,7 @@ const PaymentHistory = lazy(() => import("./pages/PaymentHistory"));
 const Referrals = lazy(() => import("./pages/Referrals"));
 const MyReferrals = lazy(() => import("./pages/MyReferrals"));
 const MyRecords = lazy(() => import("./pages/MyRecords"));
+const MyPrescriptions = lazy(() => import("./pages/MyPrescriptions"));
 const SOAPNoteEditor = lazy(() => import("./pages/SOAPNoteEditor"));
 const KnowledgeBase = lazy(() => import("./pages/KnowledgeBase"));
 const PrescriptionEditor = lazy(() => import("./pages/PrescriptionEditor"));
@@ -299,6 +300,14 @@ function RoutesWithKey() {
               element={
                 <RoleRoute role="PATIENT">
                   <MyRecords />
+                </RoleRoute>
+              }
+            />
+            <Route
+              path="/patient/prescriptions"
+              element={
+                <RoleRoute role="PATIENT">
+                  <MyPrescriptions />
                 </RoleRoute>
               }
             />

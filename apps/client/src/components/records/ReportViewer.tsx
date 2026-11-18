@@ -3,6 +3,7 @@ import { ExternalLink, Trash2, FileText, File } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useOpenRecord } from "../../hooks/mutations/useLabPharmacyMutations";
 import RecordSummaryCard from "../ai/RecordSummaryCard";
+import RecordOcrPanel, { OCR_FILE_TYPES } from "../ai/RecordOcrPanel";
 import { Card, CardContent } from "../ui/card";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -91,8 +92,14 @@ export default function ReportViewer({
           </CardContent>
           {/* The AI summary sits inside its own card, below the record — one record,
               one collapsible summary. */}
-          <div className="px-3 pb-3">
-            <RecordSummaryCard recordId={r.id} />
+          <div className="space-y-2 px-3 pb-3">
+            {/* Photographed documents carry no text layer to summarise, so they get
+                OCR instead: transcription plus a plain-language summary. */}
+            {OCR_FILE_TYPES.includes(r.fileType.toLowerCase()) ? (
+              <RecordOcrPanel recordId={r.id} />
+            ) : (
+              <RecordSummaryCard recordId={r.id} />
+            )}
           </div>
         </Card>
       ))}

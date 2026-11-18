@@ -271,6 +271,7 @@ const ur: DeepReadonlyShape<typeof en> = {
     chat: "چیٹ",
     account: "اکاؤنٹ",
     knowledgeBase: "نالج بیس",
+    myPrescriptions: "میرے نسخے",
   },
 
   profile: {
@@ -409,6 +410,7 @@ const ur: DeepReadonlyShape<typeof en> = {
     finalise: "بل حتمی کریں",
     cashPlaceholder: "زیادہ سے زیادہ {{max}}",
     invoicePdf: "انوائس PDF",
+    invoiceFailed: "انوائس ڈاؤن لوڈ نہیں ہو سکی۔",
     payCard: "کارڈ سے ادائیگی",
     paymentSubmitted: "ادائیگی جمع کر دی گئی ہے۔ ہم اسے جلد ہی تصدیق کر دیں گے۔",
     paymentFailed: "ادائیگی شروع نہیں کی جا سکی۔",
@@ -439,6 +441,7 @@ const ur: DeepReadonlyShape<typeof en> = {
     paid: "ادا شدہ",
     balanceDue: "بقایا",
     downloadInvoice: "انوائس ڈاؤن لوڈ کریں",
+    invoiceFailed: "انوائس ڈاؤن لوڈ نہیں ہو سکی۔",
   },
 
   booking: {
@@ -710,6 +713,14 @@ const ur: DeepReadonlyShape<typeof en> = {
     autosaving: "خودکار محفوظ ہو رہا ہے…",
     autosaved: "خودکار محفوظ ہو گیا",
     autosaveFailed: "خودکار محفوظ ناکام",
+    myPrescriptionsTitle: "میرے نسخے",
+    myPrescriptionsIntro:
+      "آپ کے ڈاکٹروں کی تجویز کردہ ادویات، بالکل ویسے ہی جیسے لکھی گئیں۔ کسی بھی نسخے کی سادہ الفاظ میں وضاحت مانگیں۔",
+    noPrescriptions: "ابھی کوئی نسخہ نہیں",
+    noPrescriptionsHint: "معائنے کے بعد ڈاکٹر کے جاری کردہ نسخے یہاں نظر آئیں گے۔",
+    loadFailed: "آپ کے نسخے لوڈ نہیں ہو سکے۔",
+    pdfFailed: "نسخہ ڈاؤن لوڈ نہیں ہو سکا۔",
+    itemLine: "{{dosage}}، {{frequency}}، {{days}} دن کے لیے",
   },
 
   pharmacy: {
@@ -1003,6 +1014,25 @@ const ur: DeepReadonlyShape<typeof en> = {
     appointmentAssistPlaceholder: "مثلاً اس دورے کے لیے کیا تیاری کروں؟",
     factSheet: "ملاقات کی تفصیل",
     analysisUnavailable: "AI فی الحال دستیاب نہیں — یہ ملاقات کی اپنی تفصیل ہے۔",
+    explainPrescription: "اس نسخے کی وضاحت کریں",
+    asPrescribed: "جیسا آپ کے ڈاکٹر نے تجویز کیا",
+    sideEffects: "عام مضر اثرات",
+    lifestyleNotes: "طرزِ زندگی سے متعلق ہدایات",
+    warnings: "انتباہات",
+    prescriptionExplainUnavailable:
+      "AI وضاحت فی الحال دستیاب نہیں — اوپر لکھے نسخے پر بالکل اسی طرح عمل کریں۔",
+    suggestFollowUp: "فالو اپ تجویز کریں (AI)",
+    followUpTitle: "تجویز کردہ فالو اپ",
+    followUpInDays: "{{count}} دن بعد فالو اپ",
+    rationale: "وجہ",
+    applyFollowUp: "{{count}} دن لاگو کریں",
+    followUpUnavailable: "فی الحال کوئی تجویز دستیاب نہیں — فالو اپ خود طے کریں۔",
+    readDocument: "یہ دستاویز پڑھیں (AI)",
+    readingDocument: "پڑھا جا رہا ہے…",
+    ocrTitle: "یہ دستاویز کیا کہتی ہے",
+    ocrTranscription: "صفحے پر موجود متن",
+    ocrSummaryUnavailable: "سادہ الفاظ میں خلاصہ فی الحال دستیاب نہیں — صفحے پر موجود متن نیچے ہے۔",
+    ocrUnavailable: "یہ دستاویز فی الحال پڑھی نہیں جا سکی۔ اصل فائل کھول کر دیکھیں۔",
   },
 
   chat: {
